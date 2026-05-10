@@ -11,6 +11,9 @@
 
 class XiaoZhiClient {
 public:
+    using McpToolCallback = std::function<void(const String& toolName, JsonObjectConst arguments, int callId)>;
+    using TranscriptCallback = std::function<void(const String& text)>;
+
     XiaoZhiClient();
     bool begin();
     bool end();
@@ -28,6 +31,9 @@ public:
     String getToken() const;
     String getLastError() const;
     String getFirmwareIdentity() const;
+    String getVisionUrl() const;
+    String getVisionToken() const;
+    bool hasVisionEndpoint() const;
 
     bool startListening();
     bool stopListening();
@@ -35,8 +41,11 @@ public:
     void closeAudioChannel();
 
     void setStateCallback(std::function<void(VoiceState)> cb);
+    void setMcpToolCallback(McpToolCallback cb);
+    void setTranscriptCallback(TranscriptCallback cb);
     VoiceState getState() const;
     void process();
+    void queueMcpToolTextResult(int id, const String& text, bool isError);
 
 private:
     void setState(VoiceState state);
@@ -51,9 +60,13 @@ private:
     void parseServerHello(const char* data, size_t len);
     String getHelloMessage();
     void handleMcpMessage(JsonObjectConst payload);
+
+private:
     void sendMcpResult(int id, const String& resultJson);
     void sendMcpError(int id, const String& message);
+    void sendMcpToolTextResult(int id, const String& text, bool isError);
     void sendMcpToolsList(int id);
+    void parseMcpInitializeParams(JsonObjectConst params);
     void tryStartListeningStream();
 
     bool initAudio();
@@ -99,11 +112,24 @@ private:
     volatile bool pendingStopListening_ = false;
     VoiceState state_ = VoiceState::IDLE;
     std::function<void(VoiceState)> callback_;
+    McpToolCallback mcpToolCallback_;
+
+    struct PendingMcpResult {
+        int id = 0;
+        String text;
+        bool isError = false;
+        bool valid = false;
+    };
+    static constexpr int MAX_PENDING_MCP = 4;
+    PendingMcpResult pendingMcpResults_[MAX_PENDING_MCP];
+    TranscriptCallback transcriptCallback_;
 
     String activationCode_;
     String activationMessage_;
     String webSocketUrl_;
     String token_;
+    String visionUrl_;
+    String visionToken_;
     String sessionId_;
     int lastHttpCode_ = 0;
     String lastError_;

@@ -1,6 +1,7 @@
 #include "face_ui.h"
 #include "app/app_state.h"
 #include "config/app_config.h"
+#include "ui/ui_theme.h"
 #include <M5CoreS3.h>
 #include <cmath>
 
@@ -19,12 +20,12 @@ bool FaceUI::begin() {
     canvas_.setColorDepth(16);
     spriteReady_ = canvas_.createSprite(DISPLAY_WIDTH, DISPLAY_HEIGHT) != nullptr;
     if (!spriteReady_) {
-        M5.Lcd.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Lcd.setTextColor(UiTheme::RED, UiTheme::BG);
         M5.Lcd.setCursor(0, 36);
         M5.Lcd.print("FaceUI sprite alloc failed");
         return false;
     }
-    canvas_.fillSprite(TFT_BLACK);
+    canvas_.fillSprite(UiTheme::BG);
     canvas_.pushSprite(0, 0);
     return true;
 }
@@ -55,6 +56,17 @@ void FaceUI::setTemporaryGaze(float dx, float dy, unsigned long durationMs) {
     tempGazeEndTime_ = millis() + durationMs;
 }
 
+void FaceUI::setStatusText(const char* text, uint16_t color, unsigned long ttlMs) {
+    statusText_ = text ? String(text) : String();
+    statusColor_ = color;
+    statusEndTime_ = ttlMs > 0 ? millis() + ttlMs : 0;
+}
+
+void FaceUI::clearStatusText() {
+    statusText_ = "";
+    statusEndTime_ = 0;
+}
+
 void FaceUI::update() {
     if (sleeping_ || !spriteReady_) return;
 
@@ -68,7 +80,6 @@ void FaceUI::update() {
 
 void FaceUI::updateBlink() {
     unsigned long now = millis();
-
     if (isBlinking_) {
         if (now - blinkStartTime_ > BLINK_DURATION) {
             isBlinking_ = false;
@@ -108,7 +119,7 @@ void FaceUI::updateSpeakingAnimation() {
 }
 
 void FaceUI::drawFace() {
-    canvas_.fillSprite(TFT_BLACK);
+    canvas_.fillSprite(UiTheme::BG);
 
     int cx = FACE_CENTER_X;
     int cy = FACE_CENTER_Y;
@@ -117,6 +128,21 @@ void FaceUI::drawFace() {
     drawEyebrows(cx, cy);
     drawMouth(cx, cy);
     drawCheeks(cx, cy);
+    drawStatusText();
+}
+
+void FaceUI::drawStatusText() {
+    if (statusEndTime_ > 0 && millis() > statusEndTime_) {
+        statusText_ = "";
+        statusEndTime_ = 0;
+    }
+    if (statusText_.length() == 0) return;
+
+    canvas_.setTextDatum(TC_DATUM);
+    canvas_.setTextSize(1);
+    canvas_.setTextColor(statusColor_, UiTheme::BG);
+    canvas_.drawString(statusText_, DISPLAY_WIDTH / 2, DISPLAY_HEIGHT - 12);
+    canvas_.setTextDatum(TL_DATUM);
 }
 
 void FaceUI::drawEyes(int cx, int cy) {
@@ -191,10 +217,10 @@ void FaceUI::drawEyes(int cx, int cy) {
 
     if (eyeH < eyeW) {
         int clipH = (eyeW - eyeH) / 2 + 2;
-        canvas_.fillRect(leftEyeX - eyeW / 2 - 1, eyeY - eyeW / 2 - 1, eyeW + 2, clipH, TFT_BLACK);
-        canvas_.fillRect(leftEyeX - eyeW / 2 - 1, eyeY + eyeW / 2 - clipH + 1, eyeW + 2, clipH, TFT_BLACK);
-        canvas_.fillRect(rightEyeX - eyeW / 2 - 1, eyeY - eyeW / 2 - 1, eyeW + 2, clipH, TFT_BLACK);
-        canvas_.fillRect(rightEyeX - eyeW / 2 - 1, eyeY + eyeW / 2 - clipH + 1, eyeW + 2, clipH, TFT_BLACK);
+        canvas_.fillRect(leftEyeX - eyeW / 2 - 1, eyeY - eyeW / 2 - 1, eyeW + 2, clipH, UiTheme::BG);
+        canvas_.fillRect(leftEyeX - eyeW / 2 - 1, eyeY + eyeW / 2 - clipH + 1, eyeW + 2, clipH, UiTheme::BG);
+        canvas_.fillRect(rightEyeX - eyeW / 2 - 1, eyeY - eyeW / 2 - 1, eyeW + 2, clipH, UiTheme::BG);
+        canvas_.fillRect(rightEyeX - eyeW / 2 - 1, eyeY + eyeW / 2 - clipH + 1, eyeW + 2, clipH, UiTheme::BG);
     }
 
     if (pupilR > 0) {
@@ -221,8 +247,8 @@ void FaceUI::drawEyes(int cx, int cy) {
     }
 
     if (drawArcEyes && !isBlinking_) {
-        canvas_.fillCircle(leftEyeX, eyeY, eyeW / 2, TFT_BLACK);
-        canvas_.fillCircle(rightEyeX, eyeY, eyeW / 2, TFT_BLACK);
+        canvas_.fillCircle(leftEyeX, eyeY, eyeW / 2, UiTheme::BG);
+        canvas_.fillCircle(rightEyeX, eyeY, eyeW / 2, UiTheme::BG);
         int arcW = eyeW * 3 / 4;
         for (int i = -arcW; i <= arcW; ++i) {
             int yOff = (i * i) / (arcW * 2) + 2;
@@ -279,8 +305,8 @@ void FaceUI::drawEyebrows(int cx, int cy) {
     }
 
     for (int t = 0; t < thickness; ++t) {
-        canvas_.drawLine(lx1, ly + t, lx2, ly + t, TFT_WHITE);
-        canvas_.drawLine(rx1, ry + t, rx2, ry + t, TFT_WHITE);
+        canvas_.drawLine(lx1, ly + t, lx2, ly + t, UiTheme::TEXT);
+        canvas_.drawLine(rx1, ry + t, rx2, ry + t, UiTheme::TEXT);
     }
 }
 
@@ -289,7 +315,7 @@ void FaceUI::drawMouth(int cx, int cy) {
 
     switch (static_cast<FaceEmotion>(currentEmotion_)) {
         case FaceEmotion::NORMAL:
-            canvas_.drawFastHLine(cx - BIG_MOUTH_W / 2, mouthY, BIG_MOUTH_W, TFT_WHITE);
+            canvas_.drawFastHLine(cx - BIG_MOUTH_W / 2, mouthY, BIG_MOUTH_W, UiTheme::TEXT);
             break;
         case FaceEmotion::HAPPY:
             {
@@ -328,7 +354,7 @@ void FaceUI::drawMouth(int cx, int cy) {
             break;
         case FaceEmotion::SURPRISED:
             canvas_.fillCircle(cx, mouthY, BIG_MOUTH_W / 3, TFT_WHITE);
-            canvas_.fillCircle(cx, mouthY, BIG_MOUTH_W / 3 - 4, TFT_BLACK);
+            canvas_.fillCircle(cx, mouthY, BIG_MOUTH_W / 3 - 4, UiTheme::BG);
             break;
         case FaceEmotion::SLEEPY:
             {

@@ -5,8 +5,12 @@
 enum class AppStateEnum {
     FACE,
     MENU,
+    WIFI_INFO,
     CAMERA_DEBUG,
+    AI_VISION,
     POMODORO,
+    MUSIC,
+    SYSTEM_INFO,
     AI,
     SLEEP
 };

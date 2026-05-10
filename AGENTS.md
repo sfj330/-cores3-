@@ -1,116 +1,153 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance to Codex/Coding agents when working with this repository.
 
 ## Project Overview
 
-**CoreS3 AI Desktop Pet Interaction System** — an embedded system for the National College Embedded Competition (全国大学生嵌入式比赛). Uses M5Stack CoreS3 (ESP32-S3) as the main controller. The CoreS3 acts as the pet's "head/brain", with a custom base for battery, power, PCA9685 servo driver, and 2-axis servos.
+**CoreS3 AI Desktop Pet Interaction System** is an embedded firmware project for M5Stack CoreS3 / ESP32-S3. It is used as a National College Embedded Competition desktop pet demo (全国大学生嵌入式比赛). The CoreS3 acts as the pet head/brain, with optional base hardware for battery, PCA9685 servo control, and two-axis movement.
 
-The core idea: decouple the front-end expression UI from backend camera/vision — the screen shows the pet's face (expressions, eyes), while the camera runs face detection invisibly in the background. Eye gaze direction follows the detected face position.
+The current design separates the face UI from camera/AI backends: the screen renders the pet expression, while camera preview, AI voice, AI vision, storage, and timer features run as separate state-driven modules.
 
 ## Project Status
 
-**Active development — interactive demo phase.** Core UI, Wi-Fi, SD storage, camera preview, IMU-based pomodoro, and AI placeholder are implemented. Face detection is blocked by ESP-DL/Arduino framework incompatibility (see Blocker section below).
+Active demo firmware. The project is no longer in the planning-only stage.
 
-## High-Level Architecture
+Implemented:
 
-### Main States (State Machine)
-- `STATE_FACE` — Default expression UI with 4-zone touch (NORMAL, HAPPY, CURIOUS, TRACKING, LISTENING, THINKING, SPEAKING, SURPRISED, SLEEPY, SHY)
-- `STATE_MENU` — Right-swipe function menu (Wi-Fi status, Camera Debug, Pomodoro Timer, System Info)
-- `STATE_CAMERA_DEBUG` — Camera preview with FPS overlay, right-side SHOT button, top-right Back
-- `STATE_POMODORO` — IMU flip-select 4-preset timer (Focus 25m / Short 5m / Long 15m / Deep 50m)
-- `STATE_AI` — XiaoZhi AI placeholder (left-swipe from Face, right-swipe back; shows LISTENING/THINKING/SPEAKING expressions)
-- `STATE_SLEEP` — Low-power sleep mode
+- Animated face UI with 11 emotions: `NORMAL`, `HAPPY`, `CURIOUS`, `LISTENING`, `THINKING`, `SPEAKING`, `SURPRISED`, `SLEEPY`, `TRACKING`, `SHY`, `SICK`.
+- Touch gestures: tap, double tap, left/right swipe, long press.
+- Menu with Wi-Fi, Camera, Timer, Music, and System app icons.
+- Camera preview and JPEG capture to SD.
+- AI Vision preview and JPEG description request through a XiaoZhi-provided vision endpoint.
+- IMU orientation based Pomodoro timer with four presets and screen rotation.
+- SD WAV music player.
+- XiaoZhi OTA activation/config, TLS WebSocket, Opus mic upload, Opus TTS playback, MCP handshake, and MCP tools.
+- Wi-Fi auto reconnect, SD retry/fallback, and basic power/sleep handling.
 
-### System Layers
-1. **Expression Interaction Layer** — 10 expressions (incl. SHY), 4-zone touch, temporary gaze override, left-swipe AI entry
-2. **Background Vision Layer** — Camera capture, face detection (BLOCKED), eye gaze / servo tracking
-3. **AI Voice Layer** — XiaoZhi AI placeholder mode; real WebSocket/OPUS deferred
-4. **Base Control Layer** — PCA9685, 2-axis servos, battery/power monitoring
-5. **Storage Layer** — SD/TF with auto-retry (25→10→4 MHz fallback), ensureReady() before capture
+Not implemented or intentionally disabled:
 
-### Code Structure
-```
+- Real local face detection. `FaceDetector` returns no detections and does not fake results.
+- PCA9685/servo base control. Config constants are reserved, but no servo controller is present.
+- Real battery voltage reading. `PowerManager::readVoltage()` is still a placeholder.
+- Full-duplex audio interruption or echo cancellation.
+
+## State Machine
+
+- `FACE` - default expression page.
+- `MENU` - five-icon app menu.
+- `WIFI_INFO` - Wi-Fi status page.
+- `CAMERA_DEBUG` - camera preview and SD photo capture.
+- `AI_VISION` - camera preview for XiaoZhi vision requests.
+- `POMODORO` - IMU selected timer.
+- `MUSIC` - SD WAV player.
+- `SYSTEM_INFO` - heap, PSRAM, power, and vision status page.
+- `AI` - XiaoZhi voice interaction page.
+- `SLEEP` - dim screen sleep page.
+
+## Code Structure
+
+```text
 src/
 ├── main.cpp
 ├── app/
-│   ├── app_state.h/.cpp          // Main state machine (FACE/MENU/CAMERA_DEBUG/POMODORO/AI/SLEEP)
-│   ├── gesture_manager.h/.cpp    // Tap, double-tap, swipe, long-press with coordinates
-│   └── event_bus.h/.cpp          // Inter-module event passing
-├── ui/
-│   ├── face_ui.h/.cpp            // 10 expressions + eye gaze + temporary gaze override
-│   ├── menu_ui.h/.cpp            // Right-swipe function menu with real Wi-Fi status
-│   ├── camera_debug_ui.h/.cpp    // Camera debug with right-side SHOT, PSRAM canvas
-│   └── pomodoro_ui.h/.cpp        // IMU flip-select 4-preset timer
-├── vision/
-│   ├── camera_manager.h/.cpp     // Camera capture + captureJpegToFile
-│   ├── face_detector.h/.cpp      // Face detection (BLOCKED — see below)
-│   ├── face_tracker.h/.cpp       // Face center smoothing & tracking
-│   └── imu_orientation.h/.cpp    // IMU accelerometer gravity → PomoOrientation
+│   ├── app_state.h/.cpp
+│   ├── gesture_manager.h/.cpp
+│   └── event_bus.h/.cpp
 ├── ai/
-│   ├── xiaozhi_client.h/.cpp     // XiaoZhi AI placeholder (no real WebSocket)
-│   └── voice_state.h             // Listening/Thinking/Speaking states
+│   ├── xiaozhi_client.h/.cpp
+│   └── voice_state.h
+├── audio/
+│   └── music_manager.h/.cpp
+├── config/
+│   ├── app_config.h
+│   └── wifi_secrets.example.h
 ├── network/
-│   └── wifi_manager.h/.cpp       // Wi-Fi connect/auto-reconnect with status
-├── storage/
-│   └── storage_manager.h/.cpp    // SD/TF with refresh/ensureReady/freq fallback
+│   ├── wifi_manager.h/.cpp
+│   └── vision_client.h/.cpp
 ├── power/
-│   └── power_manager.h/.cpp      // Battery, power, low-power strategy
-└── config/
-    ├── app_config.h              // Parameter configuration
-    ├── wifi_secrets.h            // Wi-Fi credentials (git-ignored)
-    └── wifi_secrets.example.h    // Wi-Fi credentials template
+│   └── power_manager.h/.cpp
+├── storage/
+│   └── storage_manager.h/.cpp
+├── ui/
+│   ├── face_ui.h/.cpp
+│   ├── menu_ui.h/.cpp
+│   ├── camera_debug_ui.h/.cpp
+│   ├── pomodoro_ui.h/.cpp
+│   ├── info_ui.h/.cpp
+│   ├── music_ui.h/.cpp
+│   └── ui_theme.h
+└── vision/
+    ├── camera_manager.h/.cpp
+    ├── face_detector.h/.cpp
+    ├── face_tracker.h/.cpp
+    └── imu_orientation.h/.cpp
 ```
 
-### FreeRTOS Tasks
+## FreeRTOS Tasks
+
 | Task | Function | Frequency |
 |------|----------|-----------|
-| UI Task | Draw expressions, menus, pomodoro via PSRAM canvas | 20 FPS |
-| Touch Task | Read touch points, recognize gestures | 50 Hz |
-| Camera Task | Camera frame capture for debug preview | 10-15 FPS |
-| Vision Task | Face detection / tracking (blocked) | 2-5 FPS |
-| AI Task | XiaoZhi AI placeholder process | 50 Hz tick |
-| Power Task | Battery voltage, low-power protection | 1 Hz |
-| Network Task | Wi-Fi auto-reconnect, status updates | 10 Hz |
+| UI | Draw active screen with PSRAM canvas where possible | 20 FPS |
+| Touch | Read touch and emit gestures | 50 Hz |
+| Camera | Push camera frames to Camera Debug / AI Vision UI | 15 FPS |
+| Vision | Reserved local face detection/tracking loop | 5 FPS |
+| AI | Process XiaoZhi WebSocket, activation, audio channel requests | 50 Hz tick |
+| Power | Battery/sleep status update | 1 Hz |
+| Network | Wi-Fi reconnect and menu status update | 5 s interval |
+| Music | Background WAV streaming task inside `MusicManager` | event-driven |
 
-### Touch Gesture Routing
-- **Face page**: Right-swipe → Menu, Left-swipe → AI, Single-tap → 4-zone touch (top=HAPPY, bottom=SHY, left/right=CURIOUS+gaze), Double-tap → AI (if WiFi), Long-press → Sleep
-- **AI page**: Right-swipe → Face, Single-tap → LISTENING, Long-press → Face
-- **Menu**: Left-swipe → Face, Right-swipe → next card, tap card → enter, tap Back → Face
-- **Camera Debug**: Tap SHOT (right side) → capture, tap Back (top-right) → Menu, Left-swipe → Menu
-- **Pomodoro**: IMU flip selects preset, tap Start/Pause/Reset, tap Back → Menu
+## Gesture Routing
 
-### Face Touch Zones
-- Top (y < cy/2): HAPPY + gaze up (摸头)
-- Bottom (y > cy+cy/2): SHY + gaze down (害羞)
-- Left (x < cx): CURIOUS + gaze left
-- Right (x >= cx): CURIOUS + gaze right
-- Temporary gaze overrides vision tracking for 1200-1500ms
+- Face: right swipe -> Menu; left swipe or double tap -> AI; tap top -> HAPPY; tap bottom -> SHY; tap left/right -> CURIOUS with gaze; long press -> Sleep.
+- AI: single tap toggles listening; right swipe or long press -> Face.
+- Menu: tap app icon -> selected page; Back -> Face; left swipe -> Face.
+- Camera Debug: SHOT -> save JPEG to `/photos`; Back or left swipe -> Menu.
+- AI Vision: Back or left swipe -> close preview and return to AI.
+- Pomodoro: IMU orientation selects preset before start; Start/Pause/Reset buttons control timer; Back or left swipe -> Menu.
+- Music: Play/Pause, Stop, Next, Back; left swipe -> Menu.
+- Sleep: tap or double tap -> Face.
 
-## Blocker: Real Face Detection
+## XiaoZhi AI Notes
 
-**ESP-DL/ESP-WHO requires ESP-IDF v5.3+ CMake build system.** Current project uses Arduino framework on PlatformIO (espressif32). ESP-DL's `.espdl` model format and component system cannot be linked under Arduino framework.
+- OTA endpoint is `https://api.tenclass.net/xiaozhi/ota/`.
+- Firmware identity comes from `XIAOZHI_BOARD_TYPE` and `XIAOZHI_FIRMWARE_VERSION` in `src/config/app_config.h`.
+- The client sends a WebSocket `hello` with Opus audio parameters and MCP enabled.
+- Audio upload is 16 kHz mono Opus, 60 ms frames, 24 kbps target bitrate.
+- Returned TTS Opus is decoded at the server-provided sample rate and played through M5Unified Speaker.
+- CoreS3 mic and speaker are handled as half-duplex.
+- MCP tools currently exposed:
+  - `self.camera.open`
+  - `self.camera.close`
+  - `self.vision.describe_scene`
+  - `self.pomodoro.open`
+- AI Vision only works when the XiaoZhi MCP initialize params provide a vision URL/token.
 
-FaceDetector currently returns `detected=false` and prints a BLOCKER report at startup.
+## Face Detection Blocker
 
-**Resolution options:**
-1. Switch entire project to ESP-IDF framework (requires rewriting M5CoreS3/M5GFX integration)
-2. Use Arduino-as-IDF-component approach (complex but feasible)
-3. Manually port ESP-DL C++ inference code + model data as Arduino-compatible library
+Do not fake real face detection.
 
-## Key Technical References
+The current firmware uses Arduino framework on PlatformIO. ESP-DL/ESP-WHO face detection models and components require an ESP-IDF CMake integration path, so `FaceDetector` intentionally reports unavailable backend and returns `detected=false`.
 
-- **M5CoreS3 Arduino Library** — Base library for CoreS3 hardware
-- **M5Unified** — Unified M5Stack device management (Display, Touch, Speaker, Microphone, IMU)
-- **M5GFX** — Graphics library with PSRAM M5Canvas support
-- **xiaozhi-esp32** (https://github.com/78/xiaozhi-esp32) — Open-source ESP32-S3 voice assistant reference
-- **ESP-DL** (https://github.com/espressif/esp-dl) — Deep learning inference (requires ESP-IDF, incompatible with Arduino)
-- **ESP-WHO** (https://github.com/espressif/esp-who) — Face detection/recognition framework (requires ESP-IDF)
+Likely future paths:
 
-## Development Environment
+1. Migrate the firmware to ESP-IDF.
+2. Use Arduino as an ESP-IDF component.
+3. Port the needed ESP-DL inference code/model loading into an Arduino-compatible library.
 
-- Platform: Arduino framework for ESP32-S3 (M5Stack CoreS3)
-- Libraries: M5CoreS3, M5Unified, M5GFX, ArduinoJSON
-- Tool: PlatformIO
-- Build: `pio run` — RAM ~18.8%, Flash ~48.0%
-- Wi-Fi secrets: `src/config/wifi_secrets.h` (git-ignored, use `wifi_secrets.example.h` as template)
+## Development Rules
+
+- Preserve user changes. Check `git status --short` before editing.
+- Keep Wi-Fi credentials in `src/config/wifi_secrets.h`; never commit real SSID/password files.
+- Build with `pio run`. If `pio` is not on `PATH`, locate the PlatformIO executable.
+- Keep display rendering centralized through UI classes and PSRAM `M5Canvas` where possible.
+- Keep camera framebuffer lifetime explicit: release frames after use and never use data after returning/freeing the framebuffer.
+- SD card handling must tolerate missing/flaky cards without rebooting. The retry sequence is 25, 10, 4, and 1 MHz.
+- Stop music before exclusive speaker/mic use by XiaoZhi AI or Pomodoro completion melody.
+- Do not claim local face recognition, servo control, or battery voltage measurement unless those paths are actually implemented and tested.
+
+## GitHub Hygiene
+
+- Commit `src/config/wifi_secrets.example.h`, not `src/config/wifi_secrets.h`.
+- Do not commit build output, monitor logs, local `.pio`, or local editor database files.
+- The GitHub Actions workflow should run PlatformIO, not the default CMake starter workflow.
+- README files should describe current firmware behavior, not the older planning-stage design.

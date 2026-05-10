@@ -15,6 +15,12 @@ struct CameraFrame {
     bool locked = false;
 };
 
+struct CameraJpeg {
+    uint8_t* data = nullptr;
+    size_t length = 0;
+    bool valid = false;
+};
+
 class CameraManager {
 public:
     CameraManager();
@@ -25,25 +31,32 @@ public:
     bool stopCapture();
     bool isInitialized() const;
 
-    // Get a frame for display (full resolution)
     CameraFrame getDisplayFrame();
-
-    // Get a frame for processing (lower resolution)
     CameraFrame getDetectionFrame();
     void releaseFrame(CameraFrame& frame);
 
     bool captureJpegToFile(const char* path, String& status);
+    bool captureJpegToMemory(CameraJpeg& jpeg, String& status);
+    void releaseJpeg(CameraJpeg& jpeg);
 
     bool isRunning() const;
+    bool isInCooldown() const;
+    unsigned long lastFailTime() const;
+    void resetFailure();
 
-    // Scale down an RGB565 frame for detection
     static void scaleDown(const uint8_t* src, uint8_t* dst,
                           int srcW, int srcH, int dstW, int dstH);
 
 private:
     bool ensureMutex();
+    void recordFail();
 
     bool initialized_ = false;
     bool capturing_ = false;
     SemaphoreHandle_t cameraMutex_ = nullptr;
+
+    int consecutiveFailCount_ = 0;
+    unsigned long lastFailTime_ = 0;
+    static constexpr int MAX_CONSECUTIVE_FAILS = 3;
+    static constexpr unsigned long FAIL_COOLDOWN_MS = 10000;
 };

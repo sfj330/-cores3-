@@ -9,6 +9,10 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 
+namespace {
+constexpr bool XIAOZHI_VERBOSE_WS_LOG = false;
+}
+
 XiaoZhiClient::XiaoZhiClient() = default;
 
 bool XiaoZhiClient::begin() {
@@ -33,6 +37,8 @@ bool XiaoZhiClient::begin() {
     lastError_ = "";
     webSocketUrl_ = "";
     token_ = "";
+    visionUrl_ = "";
+    visionToken_ = "";
     sessionId_ = "";
     deviceId_ = getMacAddress();
     deviceId_.toLowerCase();
@@ -230,6 +236,9 @@ String XiaoZhiClient::getWebSocketUrl() const { return webSocketUrl_; }
 String XiaoZhiClient::getToken() const { return token_; }
 String XiaoZhiClient::getLastError() const { return lastError_; }
 String XiaoZhiClient::getFirmwareIdentity() const { return buildUserAgent(); }
+String XiaoZhiClient::getVisionUrl() const { return visionUrl_; }
+String XiaoZhiClient::getVisionToken() const { return visionToken_; }
+bool XiaoZhiClient::hasVisionEndpoint() const { return visionUrl_.length() > 0; }
 
 String XiaoZhiClient::getHelloMessage() {
     JsonDocument doc;
@@ -418,8 +427,6 @@ void XiaoZhiClient::wsEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 void XiaoZhiClient::handleTextMessage(const char* data, size_t len) {
-    Serial.printf("XiaoZhi: WS text: %.*s\n", (int)min((size_t)200, len), data);
-
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, data, len);
     if (err) {
@@ -428,6 +435,12 @@ void XiaoZhiClient::handleTextMessage(const char* data, size_t len) {
     }
 
     String type = doc["type"] | "";
+    if (XIAOZHI_VERBOSE_WS_LOG) {
+        Serial.printf("XiaoZhi: WS text: %.*s\n", (int)min((size_t)200, len), data);
+    } else if (type != "tts" && type != "response") {
+        Serial.printf("XiaoZhi: WS type=%s\n", type.c_str());
+    }
+
     if (type == "hello") {
         parseServerHello(data, len);
     } else if (type == "mcp") {
@@ -455,6 +468,12 @@ void XiaoZhiClient::handleTextMessage(const char* data, size_t len) {
         }
     } else if (type == "stt") {
         String st = doc["state"] | "";
+        String text = doc["text"] | "";
+        if (text.length() == 0) text = doc["content"] | "";
+        if (text.length() == 0) text = doc["transcript"] | "";
+        if (text.length() > 0 && transcriptCallback_) {
+            transcriptCallback_(text);
+        }
         if (st == "stop") {
             setState(VoiceState::THINKING);
             audioCaptureRunning_ = false;
@@ -489,8 +508,9 @@ void XiaoZhiClient::handleMcpMessage(JsonObjectConst payload) {
     if (method == "initialize") {
         JsonDocument result;
         const char* protocolVersion = "2024-11-05";
-        if (payload["params"].is<JsonObject>()) {
+        if (payload["params"].is<JsonObjectConst>()) {
             JsonObjectConst params = payload["params"].as<JsonObjectConst>();
+            parseMcpInitializeParams(params);
             const char* requestedVersion = params["protocolVersion"] | nullptr;
             if (requestedVersion && requestedVersion[0] != '\0') {
                 protocolVersion = requestedVersion;
@@ -511,14 +531,22 @@ void XiaoZhiClient::handleMcpMessage(JsonObjectConst payload) {
         tryStartListeningStream();
     } else if (method == "tools/call") {
         String toolName = "";
-        if (payload["params"].is<JsonObject>()) {
+        JsonObjectConst arguments;
+        if (payload["params"].is<JsonObjectConst>()) {
             JsonObjectConst params = payload["params"].as<JsonObjectConst>();
             toolName = params["name"] | "";
+            if (params["arguments"].is<JsonObjectConst>()) {
+                arguments = params["arguments"].as<JsonObjectConst>();
+            }
         }
         if (toolName.length() == 0) {
             toolName = "unknown";
         }
-        sendMcpError(id, "No tools are implemented on this CoreS3 build: " + toolName);
+        if (!mcpToolCallback_) {
+            sendMcpToolTextResult(id, "CoreS3 has no MCP tool handler", true);
+            return;
+        }
+        mcpToolCallback_(toolName, arguments, id);
     } else {
         sendMcpError(id, "Method not implemented: " + method);
     }
@@ -550,13 +578,96 @@ void XiaoZhiClient::sendMcpError(int id, const String& message) {
     Serial.printf("XiaoZhi: sent MCP error id=%d %s\n", id, message.c_str());
 }
 
-void XiaoZhiClient::sendMcpToolsList(int id) {
+void XiaoZhiClient::sendMcpToolTextResult(int id, const String& text, bool isError) {
+    if (!wsConnected_ || sessionId_.length() == 0) return;
+
     JsonDocument result;
-    result["tools"].to<JsonArray>();
+    JsonArray content = result["content"].to<JsonArray>();
+    JsonObject item = content.add<JsonObject>();
+    item["type"] = "text";
+    item["text"] = text;
+    if (isError) {
+        result["isError"] = true;
+    } else {
+        result["isError"] = false;
+    }
 
     String resultJson;
     serializeJson(result, resultJson);
     sendMcpResult(id, resultJson);
+}
+
+void XiaoZhiClient::queueMcpToolTextResult(int id, const String& text, bool isError) {
+    for (int i = 0; i < MAX_PENDING_MCP; ++i) {
+        if (!pendingMcpResults_[i].valid) {
+            pendingMcpResults_[i].id = id;
+            pendingMcpResults_[i].text = text;
+            pendingMcpResults_[i].isError = isError;
+            pendingMcpResults_[i].valid = true;
+            return;
+        }
+    }
+    Serial.printf("XiaoZhi: MCP result queue full, dropping id=%d\n", id);
+}
+
+void XiaoZhiClient::sendMcpToolsList(int id) {
+    JsonDocument result;
+    JsonArray tools = result["tools"].to<JsonArray>();
+
+    JsonObject openTool = tools.add<JsonObject>();
+    openTool["name"] = "self.camera.open";
+    openTool["description"] = "打开 CoreS3 摄像头预览。当用户说打开摄像头、让我看看、你能看见吗时调用。";
+    JsonObject openSchema = openTool["inputSchema"].to<JsonObject>();
+    openSchema["type"] = "object";
+    openSchema["properties"].to<JsonObject>();
+
+    JsonObject closeTool = tools.add<JsonObject>();
+    closeTool["name"] = "self.camera.close";
+    closeTool["description"] = "关闭 CoreS3 摄像头预览，返回小智 AI 页面。";
+    JsonObject closeSchema = closeTool["inputSchema"].to<JsonObject>();
+    closeSchema["type"] = "object";
+    closeSchema["properties"].to<JsonObject>();
+
+    JsonObject describeTool = tools.add<JsonObject>();
+    describeTool["name"] = "self.vision.describe_scene";
+    describeTool["description"] = "用 CoreS3 摄像头拍照并识别画面。当用户问这是什么、你能看到什么、帮我识别时调用。";
+    JsonObject describeSchema = describeTool["inputSchema"].to<JsonObject>();
+    describeSchema["type"] = "object";
+    JsonObject props = describeSchema["properties"].to<JsonObject>();
+    JsonObject prompt = props["prompt"].to<JsonObject>();
+    prompt["type"] = "string";
+    JsonObject pomoTool = tools.add<JsonObject>();
+    pomoTool["name"] = "self.pomodoro.open";
+    pomoTool["description"] = "Open the CoreS3 Pomodoro timer page. Use when the user asks to open Pomodoro, timer, or focus timer mode.";
+    JsonObject pomoSchema = pomoTool["inputSchema"].to<JsonObject>();
+    pomoSchema["type"] = "object";
+    pomoSchema["properties"].to<JsonObject>();
+    prompt["description"] = "用户关于画面的可选问题。";
+
+    String resultJson;
+    serializeJson(result, resultJson);
+    sendMcpResult(id, resultJson);
+}
+
+void XiaoZhiClient::parseMcpInitializeParams(JsonObjectConst params) {
+    if (!params["capabilities"].is<JsonObjectConst>()) {
+        return;
+    }
+
+    JsonObjectConst capabilities = params["capabilities"].as<JsonObjectConst>();
+    if (!capabilities["vision"].is<JsonObjectConst>()) {
+        return;
+    }
+
+    JsonObjectConst vision = capabilities["vision"].as<JsonObjectConst>();
+    String newUrl = vision["url"] | "";
+    String newToken = vision["token"] | "";
+    if (newUrl.length() > 0) {
+        visionUrl_ = newUrl;
+        visionToken_ = newToken;
+        Serial.printf("XiaoZhi: vision endpoint ready url=%s token=%s\n",
+                      visionUrl_.c_str(), visionToken_.length() > 0 ? "yes" : "no");
+    }
 }
 
 void XiaoZhiClient::handleBinaryMessage(const uint8_t* data, size_t len) {
@@ -877,10 +988,27 @@ void XiaoZhiClient::process() {
         webSocket_.loop();
         flushOutgoingAudio();
     }
+
+    for (int i = 0; i < MAX_PENDING_MCP; ++i) {
+        if (pendingMcpResults_[i].valid) {
+            sendMcpToolTextResult(pendingMcpResults_[i].id,
+                                  pendingMcpResults_[i].text,
+                                  pendingMcpResults_[i].isError);
+            pendingMcpResults_[i].valid = false;
+        }
+    }
 }
 
 void XiaoZhiClient::setStateCallback(std::function<void(VoiceState)> cb) {
     callback_ = std::move(cb);
+}
+
+void XiaoZhiClient::setMcpToolCallback(McpToolCallback cb) {
+    mcpToolCallback_ = std::move(cb);
+}
+
+void XiaoZhiClient::setTranscriptCallback(TranscriptCallback cb) {
+    transcriptCallback_ = std::move(cb);
 }
 
 VoiceState XiaoZhiClient::getState() const { return state_; }

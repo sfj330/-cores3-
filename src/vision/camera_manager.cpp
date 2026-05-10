@@ -2,6 +2,7 @@
 #include "config/app_config.h"
 #include <M5CoreS3.h>
 #include <esp_camera.h>
+#include <esp_heap_caps.h>
 #include <img_converters.h>
 #include <SD.h>
 
@@ -9,18 +10,22 @@ CameraManager::CameraManager() = default;
 
 bool CameraManager::begin() {
     if (initialized_) return true;
-
-    if (ESP.getPsramSize() == 0) {
-        initialized_ = false;
+    if (isInCooldown()) {
+        Serial.printf("Camera: in cooldown, %lus left\n",
+                      (unsigned long)((FAIL_COOLDOWN_MS - (millis() - lastFailTime_)) / 1000));
         return false;
     }
-
+    if (ESP.getPsramSize() == 0) {
+        recordFail();
+        return false;
+    }
     if (!CoreS3.Camera.begin()) {
-        initialized_ = false;
+        recordFail();
         return false;
     }
     initialized_ = true;
     capturing_ = false;
+    resetFailure();
     return true;
 }
 
@@ -35,6 +40,7 @@ bool CameraManager::end() {
 
 bool CameraManager::startCapture() {
     if (!initialized_) return false;
+    if (isInCooldown()) return false;
     capturing_ = true;
     return true;
 }
@@ -64,7 +70,6 @@ CameraFrame CameraManager::getDisplayFrame() {
 }
 
 CameraFrame CameraManager::getDetectionFrame() {
-    // Returns the same frame — detection resolution is QVGA already
     return getDisplayFrame();
 }
 
@@ -73,7 +78,6 @@ void CameraManager::releaseFrame(CameraFrame& frame) {
         frame = CameraFrame{};
         return;
     }
-
     CoreS3.Camera.free();
     CoreS3.Camera.fb = nullptr;
     frame = CameraFrame{};
@@ -90,6 +94,27 @@ bool CameraManager::isInitialized() const {
     return initialized_;
 }
 
+bool CameraManager::isInCooldown() const {
+    if (consecutiveFailCount_ < MAX_CONSECUTIVE_FAILS) return false;
+    if (millis() - lastFailTime_ < FAIL_COOLDOWN_MS) return true;
+    return false;
+}
+
+unsigned long CameraManager::lastFailTime() const {
+    return lastFailTime_;
+}
+
+void CameraManager::resetFailure() {
+    consecutiveFailCount_ = 0;
+    lastFailTime_ = 0;
+}
+
+void CameraManager::recordFail() {
+    consecutiveFailCount_++;
+    lastFailTime_ = millis();
+    Serial.printf("Camera: fail #%d at %lus\n", consecutiveFailCount_, millis() / 1000);
+}
+
 bool CameraManager::ensureMutex() {
     if (cameraMutex_ == nullptr) {
         cameraMutex_ = xSemaphoreCreateMutex();
@@ -102,22 +127,20 @@ bool CameraManager::captureJpegToFile(const char* path, String& status) {
         status = "Camera not initialized";
         return false;
     }
-
     if (!ensureMutex()) {
         status = "Mutex create failed";
         return false;
     }
-
     if (xSemaphoreTake(cameraMutex_, pdMS_TO_TICKS(2000)) != pdTRUE) {
         status = "Camera busy";
         return false;
     }
 
     bool ok = false;
-
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
         status = "Capture failed";
+        recordFail();
         xSemaphoreGive(cameraMutex_);
         return false;
     }
@@ -163,14 +186,82 @@ bool CameraManager::captureJpegToFile(const char* path, String& status) {
 
     esp_camera_fb_return(fb);
     xSemaphoreGive(cameraMutex_);
+    if (ok) resetFailure();
     return ok;
+}
+
+bool CameraManager::captureJpegToMemory(CameraJpeg& jpeg, String& status) {
+    jpeg = CameraJpeg{};
+    if (!initialized_) {
+        status = "Camera not initialized";
+        return false;
+    }
+    if (!ensureMutex()) {
+        status = "Mutex create failed";
+        return false;
+    }
+    if (xSemaphoreTake(cameraMutex_, pdMS_TO_TICKS(2500)) != pdTRUE) {
+        status = "Camera busy";
+        return false;
+    }
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+        status = "Capture failed";
+        recordFail();
+        xSemaphoreGive(cameraMutex_);
+        return false;
+    }
+
+    bool ok = false;
+    if (fb->format == PIXFORMAT_JPEG) {
+        uint8_t* copy = static_cast<uint8_t*>(heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!copy) {
+            copy = static_cast<uint8_t*>(heap_caps_malloc(fb->len, MALLOC_CAP_8BIT));
+        }
+        if (!copy) {
+            status = "JPEG alloc failed";
+        } else {
+            memcpy(copy, fb->buf, fb->len);
+            jpeg.data = copy;
+            jpeg.length = fb->len;
+            jpeg.valid = true;
+            status = "JPEG captured";
+            ok = true;
+        }
+    } else {
+        uint8_t* jpgBuf = nullptr;
+        size_t jpgLen = 0;
+        bool jpegOk = fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
+                               fb->format, CAMERA_JPEG_QUALITY, &jpgBuf, &jpgLen);
+        if (!jpegOk || jpgBuf == nullptr) {
+            status = "JPEG convert failed";
+        } else {
+            jpeg.data = jpgBuf;
+            jpeg.length = jpgLen;
+            jpeg.valid = true;
+            status = "JPEG captured";
+            ok = true;
+        }
+    }
+
+    esp_camera_fb_return(fb);
+    xSemaphoreGive(cameraMutex_);
+    if (ok) resetFailure();
+    return ok;
+}
+
+void CameraManager::releaseJpeg(CameraJpeg& jpeg) {
+    if (jpeg.data != nullptr) {
+        free(jpeg.data);
+    }
+    jpeg = CameraJpeg{};
 }
 
 void CameraManager::scaleDown(const uint8_t* src, uint8_t* dst,
                                int srcW, int srcH, int dstW, int dstH) {
     float scaleX = (float)srcW / dstW;
     float scaleY = (float)srcH / dstH;
-
     for (int y = 0; y < dstH; ++y) {
         for (int x = 0; x < dstW; ++x) {
             int srcX = (int)(x * scaleX);

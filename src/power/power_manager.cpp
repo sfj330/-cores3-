@@ -67,7 +67,7 @@ void PowerManager::setLowBatteryCallback(LowBatteryCallback cb) {
 
 void PowerManager::enterSleep() {
     sleeping_ = true;
-    M5.Lcd.setBrightness(0);
+    M5.Lcd.setBrightness(24);
 }
 
 void PowerManager::exitSleep() {

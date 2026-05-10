@@ -1,23 +1,28 @@
 # CoreS3 AI Desktop Pet
 
-M5Stack CoreS3 firmware for an embedded competition desktop pet demo. The project combines a touch expression face, Wi-Fi, camera debug capture, IMU Pomodoro interaction, shake-to-sick expression, and a working XiaoZhi AI voice assistant path.
+Firmware for a M5Stack CoreS3 based desktop pet demo. It combines an animated expression face, touch gestures, Wi-Fi status, camera preview and photo capture, IMU driven Pomodoro interaction, SD card music playback, XiaoZhi voice interaction, and an optional AI vision flow exposed through XiaoZhi MCP tools.
+
+Chinese documentation is available in [README_CN.md](README_CN.md).
 
 ## Current Status
 
-- Face UI: touch expressions, blinking, gaze offset, and SICK expression on body shake.
-- Menu: Wi-Fi status, Camera Debug, Pomodoro, and System Info.
-- Camera Debug: preview, Back button, SHOT button, JPEG save path for SD card.
-- Pomodoro: IMU-based preset selection and four-direction screen rotation.
-- XiaoZhi AI: real OTA activation request, WebSocket connection, Opus microphone upload, Opus TTS playback, and minimal MCP handshake are implemented.
-- Face detection: disabled. No fake face detection or skin-color detection is active.
+- Face UI: 11 expressions, blinking, gaze smoothing, temporary gaze overrides, and a shake-triggered `SICK` expression.
+- Menu UI: five app icons for Wi-Fi, Camera, Timer, Music, and System pages.
+- Camera Debug: 320 x 240 preview, FPS/status overlay, Back button, and JPEG capture to SD.
+- Pomodoro: four presets selected by IMU orientation, screen rotation, timer controls, completion melody, and temporary completion emotion on the face page.
+- Music: scans `/music` on the SD card and plays up to 16 PCM WAV files.
+- XiaoZhi AI: OTA activation/config request, TLS WebSocket, Opus microphone upload, Opus TTS playback, and MCP handshake/tool handling.
+- AI Vision: camera preview and image-description requests through the vision endpoint provided by the XiaoZhi service.
+- Face detection: intentionally disabled in this Arduino/PlatformIO build. No fake face detector or skin-color detector is active.
 
 ## Hardware
 
-- M5Stack CoreS3
-- MicroSD/TF card formatted as FAT/FAT32, used by Camera Debug photo capture
-- Optional base hardware for battery, PCA9685, and servos
+- M5Stack CoreS3, ESP32-S3
+- USB cable for build/upload/serial monitor
+- MicroSD/TF card formatted as FAT/FAT32 for photos and WAV music
+- Optional base hardware for battery, PCA9685, and two-axis servos
 
-CoreS3 SD card SPI pins used by this firmware:
+CoreS3 SD SPI pins used by this firmware:
 
 ```text
 SCK  36
@@ -28,32 +33,43 @@ CS   4
 
 ## Software Requirements
 
-- Windows with PlatformIO installed
-- USB cable connected to CoreS3
+- PlatformIO Core
 - Git
+- Windows, Linux, or macOS host
 
-This project was tested with:
+The project is configured for:
 
-```powershell
-C:\Users\shenf\.platformio\penv\Scripts\platformio.exe
-```
+- PlatformIO board: `m5stack-cores3`
+- Framework: Arduino
+- MCU: ESP32-S3
+- C++ standard: C++17
+- PSRAM: QSPI PSRAM enabled by `board_build.arduino.memory_type = qio_qspi`
 
-## Clone
+## Repository Layout
 
-```powershell
-git clone https://github.com/sfj330/cores3.git
-cd cores3
+```text
+src/
+├── main.cpp
+├── app/        # State machine, gestures, event bus
+├── ai/         # XiaoZhi activation, WebSocket, Opus audio, MCP
+├── audio/      # SD WAV music player
+├── config/     # Firmware constants and Wi-Fi secret template
+├── network/    # Wi-Fi manager and AI vision HTTP client
+├── power/      # Battery/sleep placeholder logic
+├── storage/    # SD card probing, photo paths, file writes
+├── ui/         # Face, menu, camera, Pomodoro, info, music UI
+└── vision/     # Camera manager, disabled detector, tracker, IMU orientation
 ```
 
 ## Wi-Fi Setup
 
-Real credentials are kept out of Git.
+Real credentials are not committed.
 
 ```powershell
 Copy-Item src\config\wifi_secrets.example.h src\config\wifi_secrets.h
 ```
 
-Edit `src\config\wifi_secrets.h`:
+Edit `src/config/wifi_secrets.h`:
 
 ```cpp
 #pragma once
@@ -66,30 +82,25 @@ constexpr const char* WIFI_PASSWORD = "your_password";
 ## Build
 
 ```powershell
-C:\Users\shenf\.platformio\penv\Scripts\platformio.exe run
+pio run
 ```
 
-Expected result: build succeeds for `m5stack-cores3`.
+If `pio` is not on `PATH` on Windows, use the full PlatformIO executable path, for example:
 
-The current XiaoZhi build depends on:
-
-- `links2004/WebSockets`
-- `sh123/esp32_opus`
-- `bblanchon/ArduinoJson`
-- `M5CoreS3`, `M5Unified`, `M5GFX`
+```powershell
+C:\Users\<you>\.platformio\penv\Scripts\platformio.exe run
+```
 
 ## Upload
 
-Try automatic upload first:
-
 ```powershell
-C:\Users\shenf\.platformio\penv\Scripts\platformio.exe run -t upload
+pio run -t upload
 ```
 
-If automatic port detection fails, use the current known port:
+If automatic port detection fails:
 
 ```powershell
-C:\Users\shenf\.platformio\penv\Scripts\platformio.exe run -t upload --upload-port COM5
+pio run -t upload --upload-port COM5
 ```
 
 If upload does not start, long-press RESET for about 3 seconds to enter download mode. After upload finishes, press RESET once to run the firmware.
@@ -97,109 +108,83 @@ If upload does not start, long-press RESET for about 3 seconds to enter download
 ## Serial Monitor
 
 ```powershell
-C:\Users\shenf\.platformio\penv\Scripts\platformio.exe device monitor -p COM5 -b 115200
+pio device monitor -b 115200
 ```
 
-Useful XiaoZhi logs:
+With an explicit port:
 
-```text
-AI task: requesting activation code...
-XiaoZhi: OTA POST identity=m5stack-core-s3/2.2.6
-XiaoZhi: device activated, got WS config
-XiaoZhi: WS connected
-XiaoZhi: session_id=...
-XiaoZhi: MCP method=initialize id=1
-XiaoZhi: MCP method=tools/list id=2
-XiaoZhi: sent listen start
-XiaoZhi: WS text: {"type":"stt",...}
-XiaoZhi: WS text: {"type":"tts",...}
+```powershell
+pio device monitor -p COM5 -b 115200
 ```
 
 ## Controls
 
-- Face page:
-  - Right swipe: open Menu
-  - Left swipe or double tap: open XiaoZhi AI
-  - Tap top: HAPPY
-  - Tap bottom: SHY
-  - Tap left/right: CURIOUS with gaze direction
-  - Shake body: SICK expression for about 2 seconds
-  - Long press: Sleep
-- AI page:
-  - Connects to XiaoZhi after Wi-Fi is ready
-  - Single tap toggles listening
-  - Right swipe or long press returns to Face
-- Menu:
-  - Tap active card to enter
-  - Right swipe to switch card
-  - Back returns to Face
-- Camera Debug:
-  - SHOT saves `/photos/IMG_####.jpg` to SD when SD is available
-  - Back or left swipe returns to Menu
-- Pomodoro:
-  - Rotate device to select timer preset and rotate UI
-  - Start/Pause and Reset buttons control the timer
+- Face page: right swipe opens Menu; left swipe or double tap enters XiaoZhi AI; tap top/bottom/left/right changes expression and gaze; shaking the device shows `SICK`; long press enters Sleep.
+- AI page: single tap toggles listening; right swipe or long press returns to Face.
+- Menu page: tap an icon to open Wi-Fi, Camera, Timer, Music, or System; Back returns to Face.
+- Camera Debug: SHOT saves `/photos/IMG_####.jpg`; Back or left swipe returns to Menu.
+- AI Vision: Back or left swipe closes preview and returns to XiaoZhi AI.
+- Pomodoro: rotate the device to select a preset; Start/Pause and Reset control the timer; Back returns to Menu.
+- Music: Play/Pause, Stop, and Next operate on WAV files found in `/music`.
 
-## How XiaoZhi AI Works
+## SD Card Content
+
+The firmware creates and uses:
+
+```text
+/photos/IMG_####.jpg
+/music/*.wav
+```
+
+Music playback currently supports PCM WAV files with 8-bit or 16-bit samples and one or two channels. The first 16 WAV files are scanned and sorted by filename.
+
+## XiaoZhi AI
 
 The implementation is in `src/ai/xiaozhi_client.h` and `src/ai/xiaozhi_client.cpp`.
 
-1. The AI page is entered from the Face page by left swipe or double tap.
-2. The AI task requires Wi-Fi, then sends an OTA activation request to the XiaoZhi OTA endpoint.
-3. The OTA request includes the CoreS3 identity, device MAC, generated client UUID, firmware identity `m5stack-core-s3/2.2.6`, chip info, flash size, and app version.
-4. The OTA response returns WebSocket configuration: URL and token. No fake verification code is generated locally.
-5. The client opens a TLS WebSocket and sends headers:
-   - `Authorization: Bearer <token>`
-   - `Protocol-Version`
-   - `Device-Id`
-   - `Client-Id`
-6. The client sends a `hello` message declaring:
-   - transport: `websocket`
-   - audio format: `opus`
-   - microphone input: 16 kHz mono
-   - frame duration: 60 ms
-   - MCP feature enabled
-7. The server returns a session id and TTS audio parameters, normally 24 kHz Opus.
-8. The device replies to the required MCP bootstrap:
-   - `initialize`: returns protocol version, empty tool capability set, and device info.
-   - `tools/list`: returns an empty tools list.
-   - `tools/call`: returns a clear error because this build does not expose device tools yet.
-9. After MCP is ready, the client sends `listen start`.
-10. Microphone PCM is captured at 16 kHz, encoded to Opus, queued, and sent as WebSocket binary frames.
-11. Server binary Opus audio is decoded to PCM and played through the CoreS3 speaker.
+The flow is:
 
-CoreS3 microphone and speaker cannot run at the same time, so the implementation is half-duplex:
+1. Enter the AI page from the Face page.
+2. Wait for Wi-Fi, then send an OTA request to get activation/config data.
+3. Open a TLS WebSocket using the returned URL/token.
+4. Send a `hello` message with Opus audio parameters and MCP enabled.
+5. Reply to MCP bootstrap requests.
+6. Start listening after MCP is ready.
+7. Capture 16 kHz mono PCM, encode it as Opus, and send WebSocket binary frames.
+8. Decode returned Opus TTS and play it through the CoreS3 speaker.
 
-- Listening: speaker is stopped, microphone records, Opus audio is uploaded.
-- Speaking: microphone is stopped, speaker starts, received Opus TTS is decoded and played.
-- After `tts stop`, the client restarts listening if the AI page still wants listening mode.
+CoreS3 microphone and speaker are treated as half-duplex:
 
-Playback details:
+- Listening stops speaker playback and starts microphone capture.
+- Speaking stops microphone capture and starts speaker playback.
+- After TTS stops, listening restarts when the AI page still requests it.
 
-- Opus encode: 16 kHz mono, 60 ms frames, 24 kbps target bitrate.
-- Opus decode: server sample rate from `hello`, currently observed as 24 kHz.
-- Speaker output: M5Unified speaker path, 48 kHz I2S output, three internal RAM playback buffers, no per-frame forced interruption.
-- Audio capture task stack is enlarged to avoid Opus stack overflow.
+Exposed MCP tools:
+
+```text
+self.camera.open
+self.camera.close
+self.vision.describe_scene
+self.pomodoro.open
+```
+
+AI Vision depends on the vision endpoint and token delivered by the XiaoZhi service. It is not a local embedded face detector.
 
 ## Known Limitations
 
-- XiaoZhi voice is now connected, but no custom MCP device tools are exposed yet.
-- Music or long TTS playback depends on the XiaoZhi service behavior and CoreS3 speaker quality.
-- CoreS3 built-in mic and speaker are half-duplex, so true full-duplex interruption or echo cancellation is not implemented.
-- SD card detection is still hardware/card-format sensitive. The firmware should not reboot on SD failure, but photo save requires a working FAT/FAT32 card.
-- Face detection remains intentionally disabled in this Arduino/PlatformIO build.
-
-## Face Detection Notes
-
-Face detection is intentionally disabled. The previous skin-color detector is not used because it can produce false positives and would misrepresent real face recognition.
-
-Future real face detection should use a verified ESP-DL/ESP-WHO integration path, likely via ESP-IDF or Arduino-as-IDF-component.
+- Real face detection is disabled. ESP-DL/ESP-WHO integration still needs a verified ESP-IDF or Arduino-as-IDF-component path.
+- AI Vision requires a XiaoZhi-provided vision endpoint.
+- CoreS3 built-in microphone and speaker are half-duplex; full-duplex interruption and echo cancellation are not implemented.
+- Battery voltage reading is still a placeholder until the final PMU API/hardware path is validated.
+- SD card behavior depends on card format, contact, and power stability. The firmware retries SD init at 25, 10, 4, and 1 MHz.
+- Servo/PCA9685 control is reserved in configuration but not implemented in the current firmware.
 
 ## Troubleshooting
 
-- Upload loop or failed upload: long-press RESET for about 3 seconds, upload again, then press RESET once.
-- XiaoZhi OTA `400`: check `XIAOZHI_BOARD_TYPE`, `XIAOZHI_FIRMWARE_VERSION`, and OTA JSON identity in serial logs.
-- XiaoZhi WebSocket disconnects after MCP: check that `initialize` and `tools/list` responses appear before `listen start`.
-- No AI response: confirm Wi-Fi is connected, enter AI page, and check serial logs for `WS connected`, `session_id`, `sent listen start`, `stt`, and `tts`.
-- Speaker is noisy: confirm the latest firmware is flashed; current playback uses internal RAM triple buffering and 48 kHz speaker output.
-- SD not found: format the card as FAT/FAT32, reinsert it, and check serial logs for `SD.begin failed`, `CARD_NONE`, `Root open failed`, or `Probe write failed`.
+- Upload fails: long-press RESET for about 3 seconds, upload again, then press RESET once.
+- Wi-Fi shows `Not configured`: create `src/config/wifi_secrets.h` from the example.
+- XiaoZhi OTA returns `400`: check `XIAOZHI_BOARD_TYPE`, `XIAOZHI_FIRMWARE_VERSION`, and OTA identity logs.
+- XiaoZhi disconnects after MCP: confirm `initialize`, `tools/list`, and `sent listen start` appear in order.
+- No AI reply: confirm Wi-Fi is connected and serial logs show `WS connected`, `session_id`, `sent listen start`, `stt`, and `tts`.
+- AI Vision says endpoint missing: the XiaoZhi session did not provide vision capability data.
+- SD not found: format the card as FAT/FAT32 and check logs for `SD.begin failed`, `CARD_NONE`, `Root open failed`, or `Probe write failed`.

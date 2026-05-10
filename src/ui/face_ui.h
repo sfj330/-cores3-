@@ -17,12 +17,16 @@ public:
 
     void setTemporaryGaze(float dx, float dy, unsigned long durationMs);
 
+    void setStatusText(const char* text, uint16_t color = 0x7BEF, unsigned long ttlMs = 0);
+    void clearStatusText();
+
 private:
     void drawFace();
     void drawEyes(int centerX, int centerY);
     void drawEyebrows(int centerX, int centerY);
     void drawMouth(int centerX, int centerY);
     void drawCheeks(int centerX, int centerY);
+    void drawStatusText();
 
     void updateBlink();
     void updateGaze();
@@ -53,4 +57,8 @@ private:
 
     bool sleeping_ = false;
     int brightness_ = 255;
+
+    String statusText_;
+    uint16_t statusColor_ = 0x7BEF;
+    unsigned long statusEndTime_ = 0;
 };

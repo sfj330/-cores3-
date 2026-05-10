@@ -77,6 +77,7 @@ constexpr int SD_SPI_MOSI_PIN = 37;
 constexpr int SD_SPI_CS_PIN = 4;
 constexpr int SD_SPI_FREQ = 25000000;
 constexpr const char* PHOTO_DIR = "/photos";
+constexpr const char* MUSIC_DIR = "/music";
 
 // ==================== Pomodoro ====================
 constexpr int POMODORO_FOCUS_MINUTES = 25;

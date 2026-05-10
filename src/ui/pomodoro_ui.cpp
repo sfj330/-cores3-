@@ -1,20 +1,15 @@
 #include "pomodoro_ui.h"
 #include "config/app_config.h"
+#include "ui/ui_theme.h"
 #include <M5CoreS3.h>
 #include <cmath>
 #include <utility>
 
 namespace {
-constexpr uint16_t COLOR_BG = 0x0841;
-constexpr uint16_t COLOR_PANEL = 0x18E3;
-constexpr uint16_t COLOR_PANEL_DARK = 0x1082;
-constexpr uint16_t COLOR_PANEL_LIGHT = 0x2945;
-constexpr uint16_t COLOR_TEXT_DIM = 0x9CF3;
-constexpr uint16_t COLOR_TRACK = 0x4208;
-constexpr uint16_t COLOR_FOCUS = 0xFD20;
-constexpr uint16_t COLOR_SHORT = 0x07E0;
-constexpr uint16_t COLOR_LONG = 0x051F;
-constexpr uint16_t COLOR_DEEP = 0xA81F;
+constexpr uint16_t COLOR_FOCUS = UiTheme::CYAN;
+constexpr uint16_t COLOR_SHORT = UiTheme::GREEN;
+constexpr uint16_t COLOR_LONG = UiTheme::PINK;
+constexpr uint16_t COLOR_DEEP = UiTheme::AMBER;
 }
 
 PomodoroUI::PomodoroUI() : canvas_(&M5.Lcd) {}
@@ -35,7 +30,7 @@ bool PomodoroUI::ensureSprite() {
     canvas_.setColorDepth(16);
     spriteReady_ = canvas_.createSprite(w, h) != nullptr;
     if (spriteReady_) {
-        canvas_.fillSprite(TFT_BLACK);
+        canvas_.fillSprite(UiTheme::BG);
     }
     dirty_ = true;
     return spriteReady_;
@@ -125,7 +120,7 @@ uint16_t PomodoroUI::accentColor(int index) const {
         case 1: return COLOR_SHORT;
         case 2: return COLOR_LONG;
         case 3: return COLOR_DEEP;
-        default: return TFT_WHITE;
+        default: return UiTheme::TEXT;
     }
 }
 
@@ -282,27 +277,19 @@ void PomodoroUI::drawBackground() {
     int h = canvas_.height();
     uint16_t accent = activeAccentColor();
 
-    canvas_.fillSprite(COLOR_BG);
-    canvas_.fillRect(0, 0, w, 35, COLOR_PANEL_DARK);
-    canvas_.fillRect(0, 35, w, 2, accent);
-
-    for (int x = 12; x < w; x += 28) {
-        canvas_.drawPixel(x, 9, COLOR_PANEL_LIGHT);
-        canvas_.drawPixel(x + 8, h - 10, COLOR_PANEL_LIGHT);
-    }
+    canvas_.fillSprite(UiTheme::BG);
+    canvas_.fillRect(0, 0, w, 35, UiTheme::PANEL);
+    canvas_.drawFastHLine(0, 35, w, accent);
 
     canvas_.setTextDatum(TC_DATUM);
     canvas_.setTextSize(1);
-    canvas_.setTextColor(TFT_WHITE, COLOR_PANEL_DARK);
+    canvas_.setTextColor(UiTheme::TEXT, UiTheme::PANEL);
     canvas_.drawString("Pomodoro", w / 2, 9);
 
     int pillW = 64;
     int pillX = w - pillW - 8;
     if (pillX > BACK_X + BACK_W + 6) {
-        canvas_.fillRoundRect(pillX, 7, pillW, 20, 8, COLOR_PANEL);
-        canvas_.drawRoundRect(pillX, 7, pillW, 20, 8, accent);
-        canvas_.setTextColor(accent, COLOR_PANEL);
-        canvas_.drawString(statusText(), pillX + pillW / 2, 13);
+        UiTheme::drawStatusPill(canvas_, pillX, 7, pillW, statusText(), accent);
     }
 
     canvas_.setTextDatum(TL_DATUM);
@@ -322,12 +309,12 @@ void PomodoroUI::drawPresetSelector() {
     for (int i = 0; i < PRESET_COUNT; ++i) {
         int x = startX + i * (boxW + boxGap);
         uint16_t accent = accentColor(i);
-        uint16_t bgColor = (i == activePreset_) ? accent : COLOR_PANEL;
-        uint16_t txtColor = (i == activePreset_) ? TFT_BLACK : COLOR_TEXT_DIM;
+        uint16_t bgColor = (i == activePreset_) ? accent : UiTheme::PANEL;
+        uint16_t txtColor = (i == activePreset_) ? UiTheme::BG : UiTheme::TEXT_DIM;
 
         canvas_.fillRoundRect(x, y, boxW, boxH, 6, bgColor);
         if (i != activePreset_) {
-            canvas_.drawRoundRect(x, y, boxW, boxH, 6, COLOR_PANEL_LIGHT);
+            canvas_.drawRoundRect(x, y, boxW, boxH, 6, UiTheme::PANEL_LIGHT);
             canvas_.fillCircle(x + boxW / 2, y + 6, 2, accent);
         }
         canvas_.setTextColor(txtColor, bgColor);
@@ -346,21 +333,21 @@ void PomodoroUI::drawTimer() {
     int cy = h / 2 + (h < 260 ? 10 : 18);
 
     canvas_.setTextDatum(MC_DATUM);
-    canvas_.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    canvas_.setTextColor(UiTheme::TEXT_DIM, UiTheme::BG);
     canvas_.setTextSize(1);
     canvas_.drawString(presets_[activePreset_].label, w / 2, cy - 36);
 
-    canvas_.setTextColor(TFT_WHITE, COLOR_BG);
+    canvas_.setTextColor(UiTheme::TEXT, UiTheme::BG);
     canvas_.setTextSize(4);
     char timeBuf[8];
     snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", minutes, seconds);
     canvas_.drawString(timeBuf, w / 2, cy);
 
     canvas_.setTextSize(1);
-    canvas_.setTextColor(activeAccentColor(), COLOR_BG);
+    canvas_.setTextColor(activeAccentColor(), UiTheme::BG);
     canvas_.drawString(statusText(), w / 2, cy + 38);
 
-    canvas_.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    canvas_.setTextColor(UiTheme::TEXT_DIM, UiTheme::BG);
     canvas_.drawString(ImuOrientation::orientationName(currentOrientation_), w / 2, cy + 53);
     canvas_.setTextDatum(TL_DATUM);
 }
@@ -378,9 +365,9 @@ void PomodoroUI::drawProgressRing() {
     float progress = (duration > 0) ? (float)elapsed_ / duration : 0.0f;
     if (progress > 1.0f) progress = 1.0f;
 
-    canvas_.fillCircle(cx, cy, r + 8, COLOR_PANEL_DARK);
-    canvas_.drawCircle(cx, cy, r + 8, COLOR_PANEL_LIGHT);
-    canvas_.drawCircle(cx, cy, r - 16, COLOR_PANEL_LIGHT);
+    canvas_.fillCircle(cx, cy, r + 8, UiTheme::PANEL);
+    canvas_.drawCircle(cx, cy, r + 8, UiTheme::PANEL_LIGHT);
+    canvas_.drawCircle(cx, cy, r - 16, UiTheme::PANEL_LIGHT);
 
     int segments = 72;
     int litSegments = (int)(progress * segments + 0.5f);
@@ -388,7 +375,7 @@ void PomodoroUI::drawProgressRing() {
         float angle = -PI / 2 + (i / (float)segments) * 2 * PI;
         int x = cx + (int)(r * cos(angle));
         int y = cy + (int)(r * sin(angle));
-        canvas_.fillCircle(x, y, 2, COLOR_TRACK);
+        canvas_.fillCircle(x, y, 2, UiTheme::PANEL_LIGHT);
     }
     for (int i = 0; i < litSegments; ++i) {
         float angle = -PI / 2 + (i / (float)segments) * 2 * PI;
@@ -410,44 +397,38 @@ void PomodoroUI::drawControls() {
     canvas_.setTextSize(1);
     canvas_.setTextDatum(TL_DATUM);
 
-    uint16_t startColor = (state_ == PomodoroState::IDLE || paused_) ? activeAccentColor() : COLOR_PANEL_LIGHT;
+    uint16_t startColor = (state_ == PomodoroState::IDLE || paused_) ? activeAccentColor() : UiTheme::PANEL_LIGHT;
     const char* label = (state_ == PomodoroState::IDLE || paused_) ? "START" : "PAUSE";
 
     canvas_.fillRoundRect(startX, btnY, BTN_W, BTN_H, 6, startColor);
-    canvas_.drawRoundRect(startX, btnY, BTN_W, BTN_H, 6, TFT_WHITE);
-    canvas_.setTextColor((state_ == PomodoroState::IDLE || paused_) ? TFT_BLACK : TFT_WHITE, startColor);
+    canvas_.drawRoundRect(startX, btnY, BTN_W, BTN_H, 6, UiTheme::TEXT);
+    canvas_.setTextColor(UiTheme::BG, startColor);
     canvas_.setTextDatum(MC_DATUM);
     canvas_.drawString(label, startX + BTN_W / 2, btnY + BTN_H / 2 + 1);
 
-    canvas_.fillRoundRect(resetX, btnY, BTN_W, BTN_H, 6, COLOR_PANEL);
-    canvas_.drawRoundRect(resetX, btnY, BTN_W, BTN_H, 6, TFT_RED);
-    canvas_.setTextColor(TFT_RED, COLOR_PANEL);
+    canvas_.fillRoundRect(resetX, btnY, BTN_W, BTN_H, 6, UiTheme::PANEL);
+    canvas_.drawRoundRect(resetX, btnY, BTN_W, BTN_H, 6, UiTheme::RED);
+    canvas_.setTextColor(UiTheme::RED, UiTheme::PANEL);
     canvas_.drawString("RESET", resetX + BTN_W / 2, btnY + BTN_H / 2 + 1);
     canvas_.setTextDatum(TL_DATUM);
 }
 
 void PomodoroUI::drawBackButton() {
-    canvas_.fillRoundRect(BACK_X, BACK_Y, BACK_W, BACK_H, 6, COLOR_PANEL);
-    canvas_.drawRoundRect(BACK_X, BACK_Y, BACK_W, BACK_H, 6, COLOR_PANEL_LIGHT);
-    canvas_.setTextColor(TFT_WHITE, COLOR_PANEL);
-    canvas_.setTextSize(1);
-    canvas_.setTextDatum(MC_DATUM);
-    canvas_.drawString("< Back", BACK_X + BACK_W / 2, BACK_Y + BACK_H / 2 + 1);
-    canvas_.setTextDatum(TL_DATUM);
+    UiTheme::drawBackButton(canvas_, BACK_X, BACK_Y, BACK_W, BACK_H);
 }
 
 void PomodoroUI::drawNotification() {
     int w = canvas_.width();
     int h = canvas_.height();
     uint16_t accent = activeAccentColor();
-    canvas_.fillRoundRect(w / 2 - 92, h / 2 - 34, 184, 68, 8, COLOR_PANEL);
+    canvas_.fillRoundRect(w / 2 - 92, h / 2 - 34, 184, 68, 8, UiTheme::PANEL);
     canvas_.drawRoundRect(w / 2 - 92, h / 2 - 34, 184, 68, 8, accent);
-    canvas_.setTextColor(accent, COLOR_PANEL);
+    canvas_.setTextColor(accent, UiTheme::PANEL);
     canvas_.setTextSize(2);
     canvas_.setTextDatum(MC_DATUM);
     canvas_.drawString("TIME'S UP", w / 2, h / 2 - 8);
     canvas_.setTextSize(1);
-    canvas_.setTextColor(TFT_WHITE, COLOR_PANEL);
+    canvas_.setTextColor(UiTheme::TEXT, UiTheme::PANEL);
     canvas_.drawString("SESSION DONE", w / 2, h / 2 + 18);
     canvas_.setTextDatum(TL_DATUM);
 }
