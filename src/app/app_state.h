@@ -11,6 +11,7 @@ enum class AppStateEnum {
     POMODORO,
     MUSIC,
     SYSTEM_INFO,
+    SERVO_TEST,
     AI,
     SLEEP
 };

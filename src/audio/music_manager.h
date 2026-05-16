@@ -29,6 +29,11 @@ public:
     bool next();
 
 private:
+    enum class TrackType : uint8_t {
+        WAV,
+        MP3
+    };
+
     struct WavInfo {
         uint16_t channels = 0;
         uint32_t sampleRate = 0;
@@ -41,6 +46,8 @@ private:
     static void taskThunk(void* arg);
     void taskLoop();
     void playFile(int index);
+    void playWavFile(int index, File& file);
+    void playMp3File(int index);
     bool parseWav(File& file, WavInfo& info, String& error);
     bool beginSpeaker();
     void setStatus(const String& status, MusicPlaybackState state);
@@ -56,6 +63,7 @@ private:
 
     String trackPaths_[MAX_TRACKS];
     String trackNames_[MAX_TRACKS];
+    TrackType trackTypes_[MAX_TRACKS] = {};
     int trackCount_ = 0;
     int currentIndex_ = -1;
     int requestedIndex_ = 0;

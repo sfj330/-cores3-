@@ -34,6 +34,8 @@ public:
     String getVisionUrl() const;
     String getVisionToken() const;
     bool hasVisionEndpoint() const;
+    bool isPreparingListening() const;
+    bool isListeningStarted() const;
 
     bool startListening();
     bool stopListening();
@@ -70,7 +72,7 @@ private:
     void sendMcpToolTextResult(int id, const String& text, bool isError);
     void sendMcpToolsList(int id);
     void parseMcpInitializeParams(JsonObjectConst params);
-    void tryStartListeningStream();
+    bool tryStartListeningStream();
 
     bool initAudio();
     void deinitAudio();

@@ -239,6 +239,14 @@ String XiaoZhiClient::getFirmwareIdentity() const { return buildUserAgent(); }
 String XiaoZhiClient::getVisionUrl() const { return visionUrl_; }
 String XiaoZhiClient::getVisionToken() const { return visionToken_; }
 bool XiaoZhiClient::hasVisionEndpoint() const { return visionUrl_.length() > 0; }
+bool XiaoZhiClient::isPreparingListening() const {
+    return openingAudioChannel_ ||
+           pendingStartListening_ ||
+           (listenRequested_ && !listenStarted_);
+}
+bool XiaoZhiClient::isListeningStarted() const {
+    return listenStarted_ && audioCaptureRunning_ && micActive_ && wsConnected_;
+}
 
 String XiaoZhiClient::getHelloMessage() {
     JsonDocument doc;
@@ -269,6 +277,7 @@ bool XiaoZhiClient::openAudioChannel() {
     }
     unsigned long now = millis();
     if (lastAudioOpenAttemptMs_ > 0 && now - lastAudioOpenAttemptMs_ < AUDIO_OPEN_RETRY_COOLDOWN_MS) {
+        lastError_ = "Audio open cooldown";
         return false;
     }
     openingAudioChannel_ = true;
@@ -276,6 +285,7 @@ bool XiaoZhiClient::openAudioChannel() {
 
     if (!activated_ || webSocketUrl_.length() == 0) {
         Serial.println("XiaoZhi: cannot open audio channel, not activated");
+        lastError_ = "Not activated";
         openingAudioChannel_ = false;
         return false;
     }
@@ -344,6 +354,7 @@ bool XiaoZhiClient::openAudioChannel() {
     if (!wsConnected_) {
         Serial.println("XiaoZhi: WS connect timeout");
         lastError_ = "WS connect timeout";
+        setState(VoiceState::ERROR);
         openingAudioChannel_ = false;
         return false;
     }
@@ -363,13 +374,27 @@ bool XiaoZhiClient::openAudioChannel() {
         lastError_ = "Server hello timeout";
         webSocket_.disconnect();
         wsConnected_ = false;
+        setState(VoiceState::ERROR);
         openingAudioChannel_ = false;
+        return false;
+    }
+
+    if (!audioInitialized_ || !opusReady_) {
+        Serial.println("XiaoZhi: audio init incomplete after server hello");
+        lastError_ = lastError_.length() > 0 ? lastError_ : String("Audio init failed");
+        webSocket_.disconnect();
+        wsConnected_ = false;
+        audioChannelOpen_ = false;
+        openingAudioChannel_ = false;
+        setState(VoiceState::ERROR);
         return false;
     }
 
     audioChannelOpen_ = true;
     openingAudioChannel_ = false;
-    return audioInitialized_ && opusReady_;
+    lastAudioOpenAttemptMs_ = 0;
+    lastError_ = "";
+    return true;
 }
 
 void XiaoZhiClient::closeAudioChannel() {
@@ -400,6 +425,8 @@ void XiaoZhiClient::closeAudioChannel() {
     serverHelloReceived_ = false;
     listenStarted_ = false;
     mcpReady_ = false;
+    lastAudioOpenAttemptMs_ = 0;
+    setState(VoiceState::IDLE);
 }
 
 void XiaoZhiClient::pauseForForegroundTool() {
@@ -420,6 +447,7 @@ void XiaoZhiClient::pauseForForegroundTool() {
 void XiaoZhiClient::resumeFromForegroundTool() {
     if (!audioChannelOpen_ || !wsConnected_) {
         Serial.println("XiaoZhi: cannot resume, channel not open");
+        setState(VoiceState::IDLE);
         return;
     }
     startListening();
@@ -737,6 +765,27 @@ void XiaoZhiClient::sendMcpToolsList(int id) {
         reactionEnum.add("sick");
     }
 
+    {
+        JsonObject t = tools.add<JsonObject>();
+        t["name"] = "self.servo.control";
+        t["description"] = "Control the CoreS3 two-axis servo head. Use for look left, look right, look up, look down, center, nod, shake head, or release servos.";
+        JsonObject s = t["inputSchema"].to<JsonObject>();
+        s["type"] = "object";
+        JsonObject p = s["properties"].to<JsonObject>();
+        JsonObject action = p["action"].to<JsonObject>();
+        action["type"] = "string";
+        action["description"] = "Servo action: center, left, right, up, down, nod, shake, release";
+        JsonArray actionEnum = action["enum"].to<JsonArray>();
+        actionEnum.add("center");
+        actionEnum.add("left");
+        actionEnum.add("right");
+        actionEnum.add("up");
+        actionEnum.add("down");
+        actionEnum.add("nod");
+        actionEnum.add("shake");
+        actionEnum.add("release");
+    }
+
     String resultJson;
     serializeJson(result, resultJson);
     sendMcpResult(id, resultJson);
@@ -814,8 +863,7 @@ void XiaoZhiClient::parseServerHello(const char* data, size_t len) {
         return;
     }
 
-    listenRequested_ = true;
-    setState(VoiceState::LISTENING);
+    setState(VoiceState::IDLE);
     audioCaptureRunning_ = false;
 }
 
@@ -1027,8 +1075,11 @@ void XiaoZhiClient::sendAbort() {
 
 bool XiaoZhiClient::startListening() {
     if (!initialized_) return false;
+    lastError_ = "";
     pendingStartListening_ = true;
-    setState(VoiceState::LISTENING);
+    if (!audioChannelOpen_ || !mcpReady_ || !wsConnected_) {
+        setState(VoiceState::IDLE);
+    }
     return true;
 }
 
@@ -1038,18 +1089,21 @@ bool XiaoZhiClient::stopListening() {
     return true;
 }
 
-void XiaoZhiClient::tryStartListeningStream() {
+bool XiaoZhiClient::tryStartListeningStream() {
     if (!listenRequested_ || listenStarted_ || !audioChannelOpen_ || !mcpReady_ || !wsConnected_) {
-        return;
+        return false;
     }
     if (!micActive_ && !startMic()) {
-        return;
+        lastError_ = "Mic begin failed";
+        setState(VoiceState::ERROR);
+        return false;
     }
 
     sendListenStart();
     listenStarted_ = true;
     audioCaptureRunning_ = micActive_;
     setState(VoiceState::LISTENING);
+    return true;
 }
 
 void XiaoZhiClient::process() {
@@ -1071,10 +1125,19 @@ void XiaoZhiClient::process() {
         pendingStartListening_ = false;
         listenRequested_ = true;
         if (activated_ && !audioChannelOpen_) {
-            openAudioChannel();
+            if (!openAudioChannel()) {
+                listenRequested_ = false;
+                listenStarted_ = false;
+                audioCaptureRunning_ = false;
+                if (lastError_.length() == 0) {
+                    lastError_ = "Audio open failed";
+                }
+                setState(VoiceState::ERROR);
+            }
         }
-        tryStartListeningStream();
-        setState(VoiceState::LISTENING);
+        if (listenRequested_) {
+            tryStartListeningStream();
+        }
     }
 
     if (wsConnected_) {

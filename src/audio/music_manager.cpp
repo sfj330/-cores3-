@@ -2,9 +2,14 @@
 #include "config/app_config.h"
 #include <M5CoreS3.h>
 #include <SD.h>
+#include <AudioFileSourceSD.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutput.h>
 #include <cstring>
 
 namespace {
+constexpr int MUSIC_SPEAKER_CHANNEL = 6;
+
 bool readExact(File& file, void* dst, size_t len) {
     return file.read(static_cast<uint8_t*>(dst), len) == static_cast<int>(len);
 }
@@ -31,13 +36,98 @@ bool hasWavExtension(const String& name) {
     lower.toLowerCase();
     return lower.endsWith(".wav");
 }
+
+bool hasMp3Extension(const String& name) {
+    String lower = name;
+    lower.toLowerCase();
+    return lower.endsWith(".mp3");
+}
+
+bool hasAudioExtension(const String& name) {
+    return hasWavExtension(name) || hasMp3Extension(name);
+}
+
+class M5SpeakerAudioOutput : public AudioOutput {
+public:
+    M5SpeakerAudioOutput() {
+        hertz = 44100;
+        channels = 2;
+        gainF2P6 = 64;
+    }
+
+    bool begin() override {
+        if (!M5.Speaker.isRunning()) {
+            auto cfg = M5.Speaker.config();
+            cfg.sample_rate = 48000;
+            cfg.stereo = false;
+            cfg.dma_buf_count = 8;
+            cfg.dma_buf_len = 256;
+            cfg.task_priority = 5;
+            M5.Speaker.config(cfg);
+            if (!M5.Speaker.begin()) {
+                return false;
+            }
+        }
+        M5.Speaker.setVolume(160);
+        M5.Speaker.stop(MUSIC_SPEAKER_CHANNEL);
+        frameCount_ = 0;
+        return true;
+    }
+
+    bool ConsumeSample(int16_t sample[2]) override {
+        if (frameCount_ >= BUFFER_FRAMES && !flushBuffered(false)) {
+            return false;
+        }
+
+        samples_[frameCount_ * 2] = Amplify(sample[LEFTCHANNEL]);
+        samples_[frameCount_ * 2 + 1] = Amplify(sample[RIGHTCHANNEL]);
+        frameCount_++;
+
+        if (frameCount_ >= BUFFER_FRAMES) {
+            return flushBuffered(false);
+        }
+        return true;
+    }
+
+    bool stop() override {
+        flushBuffered(true);
+        M5.Speaker.stop(MUSIC_SPEAKER_CHANNEL);
+        frameCount_ = 0;
+        return true;
+    }
+
+    void flush() override {
+        flushBuffered(true);
+    }
+
+private:
+    bool flushBuffered(bool waitForQueue) {
+        if (frameCount_ == 0) return true;
+        while (true) {
+            bool queued = M5.Speaker.playRaw(samples_, frameCount_ * 2, hertz,
+                                            true, 1, MUSIC_SPEAKER_CHANNEL, false);
+            if (queued) {
+                frameCount_ = 0;
+                return true;
+            }
+            if (!waitForQueue) {
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+
+    static constexpr uint16_t BUFFER_FRAMES = 576;
+    int16_t samples_[BUFFER_FRAMES * 2] = {};
+    uint16_t frameCount_ = 0;
+};
 }
 
 bool MusicManager::begin(StorageManager* storage) {
     storage_ = storage;
     if (taskHandle_ == nullptr) {
         BaseType_t ok = xTaskCreatePinnedToCore(
-            taskThunk, "Music", 8192, this, 1, &taskHandle_, 0);
+            taskThunk, "Music", 12288, this, 1, &taskHandle_, 0);
         if (ok != pdPASS) {
             setStatus("Music task failed", MusicPlaybackState::ERROR);
             return false;
@@ -71,11 +161,12 @@ bool MusicManager::scan() {
         if (!entry) break;
         if (!entry.isDirectory()) {
             String name = entry.name();
-            if (hasWavExtension(name)) {
+            if (hasAudioExtension(name)) {
                 String path = name.startsWith("/") ? name : String(MUSIC_DIR) + "/" + name;
                 int slash = path.lastIndexOf('/');
                 trackPaths_[trackCount_] = path;
                 trackNames_[trackCount_] = slash >= 0 ? path.substring(slash + 1) : path;
+                trackTypes_[trackCount_] = hasMp3Extension(name) ? TrackType::MP3 : TrackType::WAV;
                 trackCount_++;
             }
         }
@@ -85,14 +176,14 @@ bool MusicManager::scan() {
     sortTracks();
 
     if (trackCount_ == 0) {
-        setStatus("No WAV files", MusicPlaybackState::ERROR);
+        setStatus("No audio files", MusicPlaybackState::ERROR);
         return false;
     }
 
     if (currentIndex_ < 0 || currentIndex_ >= trackCount_) {
         currentIndex_ = 0;
     }
-    setStatus(String(trackCount_) + " WAV found", MusicPlaybackState::STOPPED);
+    setStatus(String(trackCount_) + " audio found", MusicPlaybackState::STOPPED);
     return true;
 }
 
@@ -112,7 +203,7 @@ String MusicManager::currentTitle() const {
     if (currentIndex_ >= 0 && currentIndex_ < trackCount_) {
         return trackNames_[currentIndex_];
     }
-    return trackCount_ > 0 ? trackNames_[0] : String("No WAV file");
+    return trackCount_ > 0 ? trackNames_[0] : String("No audio file");
 }
 
 String MusicManager::statusText() const {
@@ -195,9 +286,24 @@ void MusicManager::playFile(int index) {
         return;
     }
 
+    if (trackTypes_[index] == TrackType::MP3) {
+        playMp3File(index);
+        return;
+    }
+
     File file = SD.open(trackPaths_[index], FILE_READ);
     if (!file) {
         setStatus("Open failed", MusicPlaybackState::ERROR);
+        return;
+    }
+
+    playWavFile(index, file);
+}
+
+void MusicManager::playWavFile(int index, File& file) {
+    if (index < 0 || index >= trackCount_) {
+        file.close();
+        setStatus("Track index error", MusicPlaybackState::ERROR);
         return;
     }
 
@@ -268,6 +374,63 @@ void MusicManager::playFile(int index) {
         }
         return;
     }
+
+    setStatus("Finishing", MusicPlaybackState::PLAYING);
+    while (M5.Speaker.isPlaying(MUSIC_CHANNEL) && !stopRequested_ && !playRequested_) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (!stopRequested_ && !playRequested_) {
+        setStatus("Done", MusicPlaybackState::STOPPED);
+    }
+}
+
+void MusicManager::playMp3File(int index) {
+    if (index < 0 || index >= trackCount_) {
+        setStatus("Track index error", MusicPlaybackState::ERROR);
+        return;
+    }
+
+    AudioFileSourceSD source;
+    if (!source.open(trackPaths_[index].c_str())) {
+        setStatus("Open failed", MusicPlaybackState::ERROR);
+        return;
+    }
+
+    M5SpeakerAudioOutput output;
+    AudioGeneratorMP3 mp3;
+    if (!mp3.begin(&source, &output)) {
+        source.close();
+        setStatus("MP3 decode failed", MusicPlaybackState::ERROR);
+        return;
+    }
+
+    currentIndex_ = index;
+    setStatus("Playing", MusicPlaybackState::PLAYING);
+
+    while (mp3.isRunning() && !stopRequested_ && !playRequested_) {
+        while (paused_ && !stopRequested_ && !playRequested_) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (stopRequested_ || playRequested_) break;
+        if (!mp3.loop()) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    if (stopRequested_ || playRequested_) {
+        mp3.stop();
+        source.close();
+        M5.Speaker.stop(MUSIC_CHANNEL);
+        if (!playRequested_) {
+            setStatus("Stopped", MusicPlaybackState::STOPPED);
+        }
+        return;
+    }
+
+    output.flush();
+    mp3.stop();
+    source.close();
 
     setStatus("Finishing", MusicPlaybackState::PLAYING);
     while (M5.Speaker.isPlaying(MUSIC_CHANNEL) && !stopRequested_ && !playRequested_) {
@@ -364,10 +527,13 @@ void MusicManager::sortTracks() {
             if (trackNames_[j].compareTo(trackNames_[i]) < 0) {
                 String tmpName = trackNames_[i];
                 String tmpPath = trackPaths_[i];
+                TrackType tmpType = trackTypes_[i];
                 trackNames_[i] = trackNames_[j];
                 trackPaths_[i] = trackPaths_[j];
+                trackTypes_[i] = trackTypes_[j];
                 trackNames_[j] = tmpName;
                 trackPaths_[j] = tmpPath;
+                trackTypes_[j] = tmpType;
             }
         }
     }

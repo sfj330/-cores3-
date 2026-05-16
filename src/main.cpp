@@ -3,6 +3,7 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include "esp_system.h"
+#include <cmath>
 
 #include "config/app_config.h"
 #include "app/app_state.h"
@@ -14,11 +15,15 @@
 #include "ui/pomodoro_ui.h"
 #include "ui/info_ui.h"
 #include "ui/music_ui.h"
+#include "ui/servo_test_ui.h"
 #include "ui/ui_theme.h"
 #include "audio/music_manager.h"
+#include "servo/servo_controller.h"
+#include "servo/servo_motion_controller.h"
 #include "vision/camera_manager.h"
 #include "vision/face_detector.h"
 #include "vision/face_tracker.h"
+#include "vision/face_tracking_controller.h"
 #include "vision/imu_orientation.h"
 #include "ai/xiaozhi_client.h"
 #include "ai/voice_state.h"
@@ -33,6 +38,7 @@ CameraDebugUI gCameraDebugUI;
 PomodoroUI gPomodoroUI;
 InfoUI gInfoUI;
 MusicUI gMusicUI;
+ServoTestUI gServoTestUI;
 CameraManager gCameraManager;
 FaceDetector gFaceDetector;
 FaceTracker gFaceTracker;
@@ -43,6 +49,9 @@ WifiManager gWifiManager;
 StorageManager gStorageManager;
 VisionClient gVisionClient;
 MusicManager gMusicManager;
+ServoController gServoController;
+ServoMotionController gServoMotionController;
+FaceTrackingController gFaceTrackingController;
 
 static float gCurrentFps = 0.0f;
 static unsigned long gLastFpsCalc = 0;
@@ -83,7 +92,8 @@ enum class PendingAiTool : uint8_t {
     VISION_DESCRIBE,
     POMODORO_OPEN,
     MUSIC_CONTROL,
-    PET_REACT
+    PET_REACT,
+    SERVO_CONTROL
 };
 
 enum class MusicAction : uint8_t {
@@ -103,15 +113,46 @@ enum class PetReaction : uint8_t {
     SICK
 };
 
+enum class ServoAiAction : uint8_t {
+    NONE = 0,
+    CENTER,
+    LEFT,
+    RIGHT,
+    UP,
+    DOWN,
+    NOD,
+    SHAKE,
+    RELEASE
+};
+
 static volatile PendingAiTool gPendingAiTool = PendingAiTool::NONE;
 static int gPendingAiCallId = -1;
 static int gPendingAiIntParam = 0;
 static volatile bool gPendingAiBoolParam = false;
 static volatile MusicAction gPendingAiMusicAction = MusicAction::NONE;
 static volatile PetReaction gPendingAiPetReaction = PetReaction::NONE;
+static volatile ServoAiAction gPendingAiServoAction = ServoAiAction::NONE;
 
 static AppStateEnum gPomodoroReturnTo = AppStateEnum::MENU;
 static AppStateEnum gMusicReturnTo = AppStateEnum::MENU;
+
+static bool gServoTestPageActive = false;
+static bool gServoTestReadyForUpdates = false;
+static bool gServoTestTrackingEnabled = true;
+static unsigned long gLastServoUpdate = 0;
+static unsigned long gLastServoSerialLog = 0;
+static float gServoFilteredPanInput = 0.0f;
+static float gServoFilteredTiltInput = 0.0f;
+static float gServoPanAngle = static_cast<float>(SERVO_PAN_CENTER_DEG);
+static float gServoTiltAngle = static_cast<float>(SERVO_TILT_CENTER_DEG);
+static FaceEmotion gLastServoPoseEmotion = FaceEmotion::NORMAL;
+
+static volatile bool gPhotoFaceTrackingActive = false;
+static volatile bool gFaceTrackHasFace = false;
+static volatile bool gFaceTrackCentered = false;
+static volatile bool gFaceTrackCorrectionPending = false;
+static float gFaceTrackPanDeltaDeg = 0.0f;
+static float gFaceTrackTiltDeltaDeg = 0.0f;
 
 static bool gPetReactActive = false;
 static FaceEmotion gPetReactEmotion = FaceEmotion::NORMAL;
@@ -163,6 +204,14 @@ static void setAiVisionStatus(AiVisionStatus status, const char* text, const cha
 static void updateInfoUiData();
 static void updateMusicUiData();
 static void stopMusicForExclusiveAudio();
+static void resetServoTestControl();
+static void updateServoTestFromImu(unsigned long now);
+static void updateSharedServoMotion(unsigned long now);
+static void applyServoPoseForEmotion(FaceEmotion emotion);
+static void applyServoPoseForPetReaction(PetReaction reaction);
+static bool prepareFaceTrackingForPhoto(String& note);
+static ServoMotionAction toServoMotionAction(ServoAiAction action);
+static const char* servoAiActionName(ServoAiAction action);
 
 static bool takeDisplayLock(TickType_t timeout = pdMS_TO_TICKS(20)) {
     return displayMutex == nullptr || xSemaphoreTake(displayMutex, timeout) == pdTRUE;
@@ -207,6 +256,279 @@ static void updateMusicUiData() {
                       gMusicManager.state());
 }
 
+static float clampFloat(float value, float minValue, float maxValue) {
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+static float applyServoDeadband(float valueDeg) {
+    return fabsf(valueDeg) < SERVO_TEST_DEADBAND_DEG ? 0.0f : valueDeg;
+}
+
+static float rateLimitAngle(float current, float target, float maxDelta) {
+    float delta = target - current;
+    if (delta > maxDelta) return current + maxDelta;
+    if (delta < -maxDelta) return current - maxDelta;
+    return target;
+}
+
+static void resetServoTestControl() {
+    gServoFilteredPanInput = 0.0f;
+    gServoFilteredTiltInput = 0.0f;
+    gServoPanAngle = static_cast<float>(SERVO_PAN_CENTER_DEG);
+    gServoTiltAngle = static_cast<float>(SERVO_TILT_CENTER_DEG);
+    gLastServoUpdate = 0;
+    gLastServoSerialLog = 0;
+}
+
+static void updateServoTestFromImu(unsigned long now) {
+    if (!gServoTestReadyForUpdates) return;
+    if (gLastServoUpdate != 0 && now - gLastServoUpdate < SERVO_TEST_UPDATE_MS) return;
+
+    float dtSec = SERVO_TEST_UPDATE_MS / 1000.0f;
+    if (gLastServoUpdate != 0) {
+        dtSec = (now - gLastServoUpdate) / 1000.0f;
+        if (dtSec <= 0.0f) {
+            dtSec = SERVO_TEST_UPDATE_MS / 1000.0f;
+        }
+    }
+    gLastServoUpdate = now;
+
+    M5.Imu.update();
+    float ax = 0.0f;
+    float ay = 0.0f;
+    float az = 0.0f;
+    M5.Imu.getAccel(&ax, &ay, &az);
+
+    float rawPan = atan2f(ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
+    float rawTilt = atan2f(ay, sqrtf(ax * ax + az * az)) * 180.0f / PI;
+    if (SERVO_PAN_INVERT) rawPan = -rawPan;
+    if (SERVO_TILT_INVERT) rawTilt = -rawTilt;
+
+    rawPan = applyServoDeadband(rawPan);
+    rawTilt = applyServoDeadband(rawTilt);
+
+    gServoFilteredPanInput += (rawPan - gServoFilteredPanInput) * SERVO_TEST_FILTER_ALPHA;
+    gServoFilteredTiltInput += (rawTilt - gServoFilteredTiltInput) * SERVO_TEST_FILTER_ALPHA;
+
+    float targetPan = static_cast<float>(SERVO_PAN_CENTER_DEG) + gServoFilteredPanInput;
+    float targetTilt = static_cast<float>(SERVO_TILT_CENTER_DEG) + gServoFilteredTiltInput;
+    targetPan = clampFloat(targetPan, SERVO_SAFE_MIN_DEG, SERVO_SAFE_MAX_DEG);
+    targetTilt = clampFloat(targetTilt, SERVO_SAFE_MIN_DEG, SERVO_SAFE_MAX_DEG);
+
+    float maxDelta = SERVO_TEST_MAX_SPEED_DPS * dtSec;
+    gServoPanAngle = rateLimitAngle(gServoPanAngle, targetPan, maxDelta);
+    gServoTiltAngle = rateLimitAngle(gServoTiltAngle, targetTilt, maxDelta);
+
+    if (gServoTestTrackingEnabled && gServoController.isReady()) {
+        gServoController.setPanTilt(gServoPanAngle, gServoTiltAngle);
+    }
+
+    gServoTestUI.setTelemetry(gServoController.isReady(),
+                              gServoController.statusText(),
+                              ax, ay, az,
+                              gServoFilteredPanInput / SERVO_TEST_SWEEP_DEG,
+                              gServoFilteredTiltInput / SERVO_TEST_SWEEP_DEG,
+                              gServoPanAngle,
+                              gServoTiltAngle,
+                              gServoController.isReleased());
+
+    if (now - gLastServoSerialLog >= 500) {
+        gLastServoSerialLog = now;
+        Serial.printf("Servo Test: ax=%.2f ay=%.2f az=%.2f xTilt=%.1f yTilt=%.1f pan=%.1f ch=%d tilt=%.1f ch=%d ready=%d\n",
+                      ax, ay, az,
+                      gServoFilteredPanInput,
+                      gServoFilteredTiltInput,
+                      gServoPanAngle,
+                      SERVO_PAN_CHANNEL,
+                      gServoTiltAngle,
+                      SERVO_TILT_CHANNEL,
+                      gServoController.isReady() ? 1 : 0);
+    }
+}
+
+static ServoMotionAction toServoMotionAction(ServoAiAction action) {
+    switch (action) {
+        case ServoAiAction::CENTER: return ServoMotionAction::CENTER;
+        case ServoAiAction::LEFT: return ServoMotionAction::LEFT;
+        case ServoAiAction::RIGHT: return ServoMotionAction::RIGHT;
+        case ServoAiAction::UP: return ServoMotionAction::UP;
+        case ServoAiAction::DOWN: return ServoMotionAction::DOWN;
+        case ServoAiAction::NOD: return ServoMotionAction::NOD;
+        case ServoAiAction::SHAKE: return ServoMotionAction::SHAKE;
+        case ServoAiAction::RELEASE: return ServoMotionAction::RELEASE;
+        default: return ServoMotionAction::NONE;
+    }
+}
+
+static const char* servoAiActionName(ServoAiAction action) {
+    switch (action) {
+        case ServoAiAction::CENTER: return "center";
+        case ServoAiAction::LEFT: return "left";
+        case ServoAiAction::RIGHT: return "right";
+        case ServoAiAction::UP: return "up";
+        case ServoAiAction::DOWN: return "down";
+        case ServoAiAction::NOD: return "nod";
+        case ServoAiAction::SHAKE: return "shake";
+        case ServoAiAction::RELEASE: return "release";
+        default: return "unknown";
+    }
+}
+
+static void applyServoPoseForPetReaction(PetReaction reaction) {
+    switch (reaction) {
+        case PetReaction::HAPPY:
+            gServoMotionController.command(ServoMotionAction::NOD);
+            break;
+        case PetReaction::SHY:
+            gServoMotionController.lookOffset(-10.0f, SERVO_FACE_TILT_OFFSET_DEG,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Shy pose");
+            break;
+        case PetReaction::CURIOUS:
+            gServoMotionController.lookOffset(SERVO_FACE_PAN_OFFSET_DEG, -6.0f,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Curious pose");
+            break;
+        case PetReaction::SLEEPY:
+            gServoMotionController.lookOffset(0.0f, SERVO_FACE_TILT_OFFSET_DEG,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Sleepy pose");
+            break;
+        case PetReaction::SURPRISED:
+            gServoMotionController.lookOffset(0.0f, -SERVO_FACE_TILT_OFFSET_DEG,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Surprised pose");
+            break;
+        case PetReaction::SICK:
+            gServoMotionController.command(ServoMotionAction::SHAKE);
+            break;
+        default:
+            gServoMotionController.center(SERVO_FACE_MOTION_SPEED_DPS);
+            break;
+    }
+}
+
+static void applyServoPoseForEmotion(FaceEmotion emotion) {
+    if (AppState::instance().getState() == AppStateEnum::SERVO_TEST) return;
+
+    switch (emotion) {
+        case FaceEmotion::NORMAL:
+            gServoMotionController.center(SERVO_FACE_MOTION_SPEED_DPS);
+            break;
+        case FaceEmotion::HAPPY:
+            gServoMotionController.command(ServoMotionAction::NOD);
+            break;
+        case FaceEmotion::CURIOUS:
+            gServoMotionController.lookOffset(SERVO_FACE_PAN_OFFSET_DEG, -5.0f,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Curious pose");
+            break;
+        case FaceEmotion::LISTENING:
+            gServoMotionController.lookOffset(0.0f, -5.0f,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Listening pose");
+            break;
+        case FaceEmotion::THINKING:
+            gServoMotionController.lookOffset(12.0f, -8.0f,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Thinking pose");
+            break;
+        case FaceEmotion::SPEAKING:
+            gServoMotionController.lookOffset(0.0f, -2.0f,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Speaking pose");
+            break;
+        case FaceEmotion::SURPRISED:
+            gServoMotionController.lookOffset(0.0f, -SERVO_FACE_TILT_OFFSET_DEG,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Surprised pose");
+            break;
+        case FaceEmotion::SLEEPY:
+            gServoMotionController.lookOffset(0.0f, SERVO_FACE_TILT_OFFSET_DEG,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Sleepy pose");
+            break;
+        case FaceEmotion::TRACKING:
+            break;
+        case FaceEmotion::SHY:
+            gServoMotionController.lookOffset(-10.0f, SERVO_FACE_TILT_OFFSET_DEG,
+                                              SERVO_FACE_MOTION_SPEED_DPS, "Shy pose");
+            break;
+        case FaceEmotion::SICK:
+            gServoMotionController.command(ServoMotionAction::SHAKE);
+            break;
+    }
+}
+
+static void updateSharedServoMotion(unsigned long now) {
+    AppStateEnum state = AppState::instance().getState();
+    if (state == AppStateEnum::SERVO_TEST) {
+        gServoMotionController.suspend();
+        return;
+    }
+
+    if (gFaceTrackCorrectionPending &&
+        (state == AppStateEnum::CAMERA_DEBUG || state == AppStateEnum::AI_VISION)) {
+        float panDelta = gFaceTrackPanDeltaDeg;
+        float tiltDelta = gFaceTrackTiltDeltaDeg;
+        gFaceTrackCorrectionPending = false;
+        gServoMotionController.nudge(panDelta, tiltDelta,
+                                     SERVO_TRACKING_MOTION_SPEED_DPS,
+                                     "Face tracking");
+    }
+
+    if (state == AppStateEnum::FACE || state == AppStateEnum::AI) {
+        FaceEmotion emotion = AppState::instance().getEmotion();
+        if (emotion != gLastServoPoseEmotion) {
+            gLastServoPoseEmotion = emotion;
+            applyServoPoseForEmotion(emotion);
+        }
+    }
+
+    if (state == AppStateEnum::FACE ||
+        state == AppStateEnum::AI ||
+        state == AppStateEnum::CAMERA_DEBUG ||
+        state == AppStateEnum::AI_VISION) {
+        gServoMotionController.update(now);
+    }
+}
+
+static bool prepareFaceTrackingForPhoto(String& note) {
+    note = "";
+
+    if (!gFaceDetector.backendAvailable()) {
+        note = "face tracking unavailable";
+        return false;
+    }
+
+    gFaceDetector.setEnabled(true);
+    if (!gFaceDetector.isEnabled()) {
+        note = "face tracking disabled";
+        return false;
+    }
+
+    gFaceTrackingController.reset();
+    gPhotoFaceTrackingActive = true;
+    gFaceTrackHasFace = false;
+    gFaceTrackCentered = false;
+    gFaceTrackCorrectionPending = false;
+
+    unsigned long start = millis();
+    while (millis() - start < SERVO_PHOTO_TRACK_SETTLE_MS) {
+        unsigned long now = millis();
+        updateSharedServoMotion(now);
+        if (gFaceTrackCentered) {
+            break;
+        }
+        delay(20);
+    }
+
+    bool hadFace = gFaceTrackHasFace;
+    bool centered = gFaceTrackCentered;
+    gPhotoFaceTrackingActive = false;
+
+    if (centered) {
+        note = "face centered";
+    } else if (hadFace) {
+        note = "face tracking timeout";
+    } else {
+        note = "no face detected";
+    }
+    return centered;
+}
+
 static void updateAiStatusText() {
     if (AppState::instance().getState() != AppStateEnum::AI) return;
 
@@ -231,14 +553,25 @@ static void updateAiStatusText() {
     }
 
     if (!gXiaoZhiClient.isWsConnected()) {
-        gFaceUI.setStatusText("Connecting...", UiTheme::AMBER);
+        String err = gXiaoZhiClient.getLastError();
+        if (gXiaoZhiClient.getState() == VoiceState::ERROR && err.length() > 0) {
+            gFaceUI.setStatusText(err.c_str(), UiTheme::RED);
+        } else {
+            gFaceUI.setStatusText("Connecting...", UiTheme::AMBER);
+        }
+        return;
+    }
+
+    if (gXiaoZhiClient.isPreparingListening()) {
+        gFaceUI.setStatusText("Preparing mic...", UiTheme::AMBER);
         return;
     }
 
     VoiceState vs = gXiaoZhiClient.getState();
     switch (vs) {
         case VoiceState::LISTENING:
-            gFaceUI.setStatusText("Listening", UiTheme::CYAN);
+            gFaceUI.setStatusText(gXiaoZhiClient.isListeningStarted() ? "Listening" : "Preparing mic...",
+                                  gXiaoZhiClient.isListeningStarted() ? UiTheme::CYAN : UiTheme::AMBER);
             break;
         case VoiceState::THINKING:
             gFaceUI.setStatusText("Thinking", UiTheme::AMBER);
@@ -247,7 +580,10 @@ static void updateAiStatusText() {
             gFaceUI.setStatusText("Speaking", UiTheme::GREEN);
             break;
         case VoiceState::ERROR:
-            gFaceUI.setStatusText("Error", UiTheme::RED);
+            {
+                String err = gXiaoZhiClient.getLastError();
+                gFaceUI.setStatusText(err.length() > 0 ? err.c_str() : "Error", UiTheme::RED);
+            }
             break;
         default:
             gFaceUI.setStatusText("Tap to talk", UiTheme::TEXT_DIM);
@@ -264,20 +600,26 @@ static void handleFaceTap(int x, int y) {
     if (y < cy / 2) {
         appState.setEmotion(FaceEmotion::HAPPY);
         gFaceUI.setTemporaryGaze(0.0f, -0.5f, 1500);
+        gServoMotionController.command(ServoMotionAction::NOD);
     } else if (y > cy + cy / 2) {
         appState.setEmotion(FaceEmotion::SHY);
         gFaceUI.setTemporaryGaze(0.0f, 0.5f, 1500);
+        gServoMotionController.lookOffset(-10.0f, SERVO_FACE_TILT_OFFSET_DEG,
+                                          SERVO_FACE_MOTION_SPEED_DPS, "Face tap shy");
     } else if (x < cx) {
         gFaceUI.setTemporaryGaze(-1.0f, 0.0f, 1200);
+        gServoMotionController.command(ServoMotionAction::LEFT);
         if (appState.getEmotion() != FaceEmotion::TRACKING) {
             appState.setEmotion(FaceEmotion::CURIOUS);
         }
     } else {
         gFaceUI.setTemporaryGaze(1.0f, 0.0f, 1200);
+        gServoMotionController.command(ServoMotionAction::RIGHT);
         if (appState.getEmotion() != FaceEmotion::TRACKING) {
             appState.setEmotion(FaceEmotion::CURIOUS);
         }
     }
+    gLastServoPoseEmotion = appState.getEmotion();
 }
 
 void uiTask(void* pvParameters) {
@@ -322,6 +664,10 @@ void uiTask(void* pvParameters) {
                 case AppStateEnum::MUSIC:
                     updateMusicUiData();
                     gMusicUI.update();
+                    break;
+
+                case AppStateEnum::SERVO_TEST:
+                    gServoTestUI.update();
                     break;
 
                 case AppStateEnum::AI:
@@ -401,13 +747,32 @@ void visionTask(void* pvParameters) {
     while (true) {
         AppStateEnum state = AppState::instance().getState();
 
-        if (state == AppStateEnum::FACE || state == AppStateEnum::CAMERA_DEBUG) {
+        if (state == AppStateEnum::FACE ||
+            state == AppStateEnum::CAMERA_DEBUG ||
+            state == AppStateEnum::AI_VISION) {
             if (gCameraManager.isRunning() && gFaceDetector.isEnabled() && gFaceDetector.backendAvailable()) {
                 CameraFrame frame = gCameraManager.getDetectionFrame();
                 if (frame.valid) {
+                    int frameWidth = frame.width;
+                    int frameHeight = frame.height;
                     FaceResult face = gFaceDetector.detect(frame.data, frame.width, frame.height);
                     gCameraManager.releaseFrame(frame);
                     gFaceTracker.update(face);
+
+                    if (gPhotoFaceTrackingActive &&
+                        (state == AppStateEnum::CAMERA_DEBUG || state == AppStateEnum::AI_VISION)) {
+                        float panDelta = 0.0f;
+                        float tiltDelta = 0.0f;
+                        bool hasFace = gFaceTrackingController.update(face, frameWidth, frameHeight,
+                                                                      panDelta, tiltDelta);
+                        gFaceTrackHasFace = hasFace;
+                        gFaceTrackCentered = hasFace && gFaceTrackingController.isCentered();
+                        if (hasFace && (fabsf(panDelta) > 0.01f || fabsf(tiltDelta) > 0.01f)) {
+                            gFaceTrackPanDeltaDeg = panDelta;
+                            gFaceTrackTiltDeltaDeg = tiltDelta;
+                            gFaceTrackCorrectionPending = true;
+                        }
+                    }
 
                     if (gFaceTracker.hasFace()) {
                         gFaceUI.setGazeOffset(gFaceTracker.getGazeX(), gFaceTracker.getGazeY());
@@ -472,7 +837,9 @@ void aiTask(void* pvParameters) {
         if (gNeedOpenAudioChannel) {
             gNeedOpenAudioChannel = false;
             Serial.println("AI task: opening audio channel...");
-            gXiaoZhiClient.openAudioChannel();
+            if (gXiaoZhiClient.openAudioChannel()) {
+                gXiaoZhiClient.startListening();
+            }
         }
 
         vTaskDelay(delayTicks);
@@ -524,12 +891,22 @@ static void handleCameraShot() {
         return;
     }
 
+    String trackingNote;
+    gCameraDebugUI.setCaptureStatus(gFaceDetector.backendAvailable() ?
+                                    "Centering face..." :
+                                    "Capturing (no face tracking)");
+    prepareFaceTrackingForPhoto(trackingNote);
+
     String status;
     bool ok = gCameraManager.captureJpegToFile(path.c_str(), status);
     if (ok) {
         gCameraDebugUI.setLastPhotoPath(path.c_str());
+        if (trackingNote.length() > 0) {
+            status += "; ";
+            status += trackingNote;
+        }
         gCameraDebugUI.setCaptureStatus(status.c_str());
-        Serial.printf("Photo saved: %s\n", path.c_str());
+        Serial.printf("Photo saved: %s (%s)\n", path.c_str(), trackingNote.c_str());
     } else {
         gCameraDebugUI.setCaptureStatus(status.c_str());
         Serial.printf("Photo failed: %s\n", status.c_str());
@@ -582,7 +959,39 @@ static void handleXiaoZhiTranscript(const String& text) {
                      containsAny(text, "卖萌", "做个鬼脸") ||
                      containsAny(text, "生个病", "装病");
 
-    if (asksDescribe) {
+    bool asksServoLeft = containsAny(text, "看左边", "往左看", "转左边") ||
+                         containsAny(lower, "look left", "turn left");
+    bool asksServoRight = containsAny(text, "看右边", "往右看", "转右边") ||
+                          containsAny(lower, "look right", "turn right");
+    bool asksServoUp = containsAny(text, "抬头", "往上看", "看上面") ||
+                       containsAny(lower, "look up", "head up");
+    bool asksServoDown = containsAny(text, "低头", "往下看", "看下面") ||
+                         containsAny(lower, "look down", "head down");
+    bool asksServoCenter = containsAny(text, "回中", "回正", "看前面") ||
+                           containsAny(text, "回到中间") ||
+                           containsAny(lower, "center servo", "look center", "look forward");
+    bool asksServoNod = containsAny(text, "点点头", "点头") ||
+                        containsAny(lower, "nod");
+    bool asksServoShake = containsAny(text, "摇摇头", "摇头") ||
+                          containsAny(lower, "shake head");
+    bool asksServoRelease = containsAny(text, "释放舵机", "松开舵机", "关闭舵机") ||
+                            containsAny(lower, "release servo");
+    bool asksServo = asksServoLeft || asksServoRight || asksServoUp || asksServoDown ||
+                     asksServoCenter || asksServoNod || asksServoShake || asksServoRelease;
+
+    if (asksServo) {
+        gPendingAiTool = PendingAiTool::SERVO_CONTROL;
+        gPendingAiCallId = -1;
+        if (asksServoRelease) gPendingAiServoAction = ServoAiAction::RELEASE;
+        else if (asksServoNod) gPendingAiServoAction = ServoAiAction::NOD;
+        else if (asksServoShake) gPendingAiServoAction = ServoAiAction::SHAKE;
+        else if (asksServoLeft) gPendingAiServoAction = ServoAiAction::LEFT;
+        else if (asksServoRight) gPendingAiServoAction = ServoAiAction::RIGHT;
+        else if (asksServoUp) gPendingAiServoAction = ServoAiAction::UP;
+        else if (asksServoDown) gPendingAiServoAction = ServoAiAction::DOWN;
+        else gPendingAiServoAction = ServoAiAction::CENTER;
+        Serial.println("AI transcript fallback: servo control");
+    } else if (asksDescribe) {
         gPendingAiTool = PendingAiTool::VISION_DESCRIBE;
         gPendingAiCallId = -1;
         Serial.println("AI transcript fallback: describe scene");
@@ -702,15 +1111,28 @@ static void processCameraCapturePhoto(int callId) {
         return;
     }
 
+    String trackingNote;
+    setAiVisionStatus(AiVisionStatus::PREVIEW,
+                      gFaceDetector.backendAvailable() ? "Centering face..." : "Capturing photo",
+                      gAiVisionResultText.c_str());
+    prepareFaceTrackingForPhoto(trackingNote);
+
     String status;
     bool ok = gCameraManager.captureJpegToFile(path.c_str(), status);
     if (ok) {
-        Serial.printf("Voice photo saved: %s\n", path.c_str());
+        Serial.printf("Voice photo saved: %s (%s)\n", path.c_str(), trackingNote.c_str());
+        String result = "Photo saved: " + path;
+        if (trackingNote.length() > 0) {
+            result += "; ";
+            result += trackingNote;
+        }
+        setAiVisionStatus(AiVisionStatus::DONE, "Photo saved", trackingNote.c_str());
         if (callId >= 0) {
-            gXiaoZhiClient.queueMcpToolTextResult(callId, "Photo saved: " + path, false);
+            gXiaoZhiClient.queueMcpToolTextResult(callId, result, false);
         }
     } else {
         Serial.printf("Voice photo failed: %s\n", status.c_str());
+        setAiVisionStatus(AiVisionStatus::ERROR, status.c_str(), status.c_str());
         if (callId >= 0) {
             gXiaoZhiClient.queueMcpToolTextResult(callId, "Photo capture failed: " + status, true);
         }
@@ -925,6 +1347,8 @@ static void processPetReact(int callId) {
     gPetReactActive = true;
     gPetReactUntil = millis() + PET_REACT_DURATION_MS;
     AppState::instance().setEmotion(emotion);
+    gLastServoPoseEmotion = emotion;
+    applyServoPoseForPetReaction(reaction);
 
     const char* name = petReactionName(reaction);
     gFaceUI.setStatusText(name, UiTheme::CYAN, PET_REACT_DURATION_MS);
@@ -935,6 +1359,42 @@ static void processPetReact(int callId) {
     }
 
     Serial.printf("AI pet react: %s\n", name);
+}
+
+static void processServoControl(int callId) {
+    ServoAiAction action = gPendingAiServoAction;
+    if (action == ServoAiAction::NONE) {
+        action = ServoAiAction::CENTER;
+    }
+
+    if (AppState::instance().getState() == AppStateEnum::SERVO_TEST) {
+        if (callId >= 0) {
+            gXiaoZhiClient.queueMcpToolTextResult(callId,
+                "Servo Test owns the servos. Leave Servo Test before voice servo control.", true);
+        }
+        return;
+    }
+
+    ServoMotionAction motionAction = toServoMotionAction(action);
+    bool ok = false;
+    if (motionAction == ServoMotionAction::RELEASE) {
+        ok = gServoMotionController.release();
+    } else {
+        ok = gServoMotionController.ensureReady() &&
+             gServoMotionController.command(motionAction);
+    }
+
+    String result = String("Servo action: ") + servoAiActionName(action);
+    if (!ok) {
+        result += " failed: ";
+        result += gServoMotionController.statusText();
+    }
+
+    if (callId >= 0) {
+        gXiaoZhiClient.queueMcpToolTextResult(callId, result, !ok);
+    }
+
+    Serial.printf("AI servo control: %s ok=%d\n", servoAiActionName(action), ok ? 1 : 0);
 }
 
 static void processPendingAiTool() {
@@ -966,6 +1426,9 @@ static void processPendingAiTool() {
             break;
         case PendingAiTool::PET_REACT:
             processPetReact(callId);
+            break;
+        case PendingAiTool::SERVO_CONTROL:
+            processServoControl(callId);
             break;
         default:
             break;
@@ -1115,6 +1578,25 @@ static void handleXiaoZhiMcpTool(const String& toolName, JsonObjectConst argumen
         return;
     }
 
+    if (toolName == "self.servo.control") {
+        ServoAiAction action = ServoAiAction::NONE;
+        if (!arguments.isNull()) {
+            String actionStr = arguments["action"] | "";
+            if (actionStr == "center") action = ServoAiAction::CENTER;
+            else if (actionStr == "left") action = ServoAiAction::LEFT;
+            else if (actionStr == "right") action = ServoAiAction::RIGHT;
+            else if (actionStr == "up") action = ServoAiAction::UP;
+            else if (actionStr == "down") action = ServoAiAction::DOWN;
+            else if (actionStr == "nod") action = ServoAiAction::NOD;
+            else if (actionStr == "shake") action = ServoAiAction::SHAKE;
+            else if (actionStr == "release") action = ServoAiAction::RELEASE;
+        }
+        gPendingAiTool = PendingAiTool::SERVO_CONTROL;
+        gPendingAiCallId = callId;
+        gPendingAiServoAction = action;
+        return;
+    }
+
     gXiaoZhiClient.queueMcpToolTextResult(callId, "Unknown CoreS3 tool: " + toolName, true);
 }
 
@@ -1194,6 +1676,7 @@ static void gestureEventHandler(const GestureEvent& event) {
                         case 2: gPomodoroReturnTo = AppStateEnum::MENU; appState.setState(AppStateEnum::POMODORO); break;
                         case 3: gMusicReturnTo = AppStateEnum::MENU; appState.setState(AppStateEnum::MUSIC); break;
                         case 4: appState.setState(AppStateEnum::SYSTEM_INFO); break;
+                        case 5: appState.setState(AppStateEnum::SERVO_TEST); break;
                     }
                     break;
                 }
@@ -1330,6 +1813,42 @@ static void gestureEventHandler(const GestureEvent& event) {
             break;
         }
 
+        case AppStateEnum::SERVO_TEST: {
+            ServoHitZone hit = gServoTestUI.hitTest(event.endX, event.endY);
+            if (event.type == GestureType::SINGLE_TAP) {
+                if (hit == ServoHitZone::SERVO_HIT_BACK) {
+                    appState.setState(AppStateEnum::MENU);
+                    break;
+                }
+                resetServoTestControl();
+                gServoTestTrackingEnabled = true;
+                gServoController.center();
+                gServoTestUI.markDirty();
+                Serial.println("Servo Test: center");
+                break;
+            }
+            switch (event.type) {
+                case GestureType::LEFT_SWIPE:
+                    appState.setState(AppStateEnum::MENU);
+                    break;
+                case GestureType::LONG_PRESS:
+                    gServoTestTrackingEnabled = false;
+                    gServoController.release();
+                    gServoTestUI.setTelemetry(gServoController.isReady(),
+                                              gServoController.statusText(),
+                                              0.0f, 0.0f, 0.0f,
+                                              gServoFilteredPanInput,
+                                              gServoFilteredTiltInput,
+                                              gServoPanAngle,
+                                              gServoTiltAngle,
+                                              gServoController.isReleased());
+                    break;
+                default:
+                    break;
+            }
+            break;
+        }
+
         case AppStateEnum::SLEEP:
             switch (event.type) {
                 case GestureType::SINGLE_TAP:
@@ -1349,6 +1868,18 @@ static void gestureEventHandler(const GestureEvent& event) {
 }
 
 static void stateChangeHandler(AppStateEnum state) {
+    if (state != AppStateEnum::SERVO_TEST) {
+        gServoTestReadyForUpdates = false;
+        if (gServoTestPageActive) {
+            gServoController.center();
+            gServoTestPageActive = false;
+        }
+        gServoTestUI.hide();
+    }
+    if (state != AppStateEnum::CAMERA_DEBUG && state != AppStateEnum::AI_VISION) {
+        gPhotoFaceTrackingActive = false;
+    }
+
     switch (state) {
         case AppStateEnum::FACE:
             gMenuUI.hide();
@@ -1370,13 +1901,16 @@ static void stateChangeHandler(AppStateEnum state) {
             gSickActive = false;
             gSickUntil = 0;
             gActivationCodeRequested = false;
-            if (gFaceDetector.backendAvailable() && gFaceDetector.isEnabled()) {
+            if (gFaceDetector.backendAvailable()) {
+                gFaceDetector.setEnabled(true);
                 if (!gCameraManager.isRunning()) {
                     bool camOk = gCameraManager.isInitialized() || gCameraManager.begin();
                     camOk = camOk && gCameraManager.startCapture();
                     Serial.println(camOk ? "Vision: camera started" : "Vision: camera start failed");
                 }
             }
+            gLastServoPoseEmotion = AppState::instance().getEmotion();
+            applyServoPoseForEmotion(gLastServoPoseEmotion);
             break;
 
         case AppStateEnum::AI:
@@ -1404,6 +1938,8 @@ static void stateChangeHandler(AppStateEnum state) {
                 AppState::instance().setEmotion(FaceEmotion::SURPRISED);
                 Serial.println("AI: Wi-Fi not connected");
             }
+            gLastServoPoseEmotion = AppState::instance().getEmotion();
+            applyServoPoseForEmotion(gLastServoPoseEmotion);
             break;
 
         case AppStateEnum::AI_VISION: {
@@ -1415,6 +1951,9 @@ static void stateChangeHandler(AppStateEnum state) {
             gCameraDebugUI.setVisionStatus(gAiVisionStatusText.c_str());
             gCameraDebugUI.setVisionResult(gAiVisionResultText.c_str());
             gCameraDebugUI.show(CameraViewMode::AI_VISION);
+            if (gFaceDetector.backendAvailable()) {
+                gFaceDetector.setEnabled(true);
+            }
             bool cameraReady = gCameraManager.isInitialized() || gCameraManager.begin();
             cameraReady = cameraReady && gCameraManager.startCapture();
             gCameraDebugUI.setCameraReady(cameraReady);
@@ -1463,6 +2002,9 @@ static void stateChangeHandler(AppStateEnum state) {
             gCameraDebugUI.setSdReady(gStorageManager.isReady());
             gCameraDebugUI.setCaptureStatus(gStorageManager.statusText().c_str());
             gCameraDebugUI.show(CameraViewMode::DEBUG);
+            if (gFaceDetector.backendAvailable()) {
+                gFaceDetector.setEnabled(true);
+            }
             if (!gCameraManager.isRunning()) {
                 bool cameraReady = gCameraManager.isInitialized() || gCameraManager.begin();
                 cameraReady = cameraReady && gCameraManager.startCapture();
@@ -1492,6 +2034,34 @@ static void stateChangeHandler(AppStateEnum state) {
             updateMusicUiData();
             gMusicUI.show();
             break;
+
+        case AppStateEnum::SERVO_TEST: {
+            gMenuUI.hide();
+            gCameraDebugUI.hide();
+            gPomodoroUI.hide();
+            gInfoUI.hide();
+            gMusicUI.hide();
+            gServoTestPageActive = true;
+            gServoTestReadyForUpdates = false;
+            gServoTestTrackingEnabled = true;
+            resetServoTestControl();
+            bool servoReady = gServoController.begin();
+            if (servoReady) {
+                gServoController.center();
+            }
+            gServoTestUI.show();
+            gServoTestUI.setTelemetry(servoReady,
+                                      gServoController.statusText(),
+                                      0.0f, 0.0f, 0.0f,
+                                      gServoFilteredPanInput,
+                                      gServoFilteredTiltInput,
+                                      gServoPanAngle,
+                                      gServoTiltAngle,
+                                      gServoController.isReleased());
+            gServoTestReadyForUpdates = true;
+            Serial.println(servoReady ? "Servo Test: started" : "Servo Test: PCA9685 unavailable");
+            break;
+        }
 
         case AppStateEnum::SLEEP:
             if (takeDisplayLock()) {
@@ -1684,6 +2254,8 @@ void setup() {
     bootStep("PomodoroUI...", 5);
     gPomodoroUI.begin();
     gMusicUI.begin();
+    gServoTestUI.begin();
+    gServoMotionController.attach(gServoController);
     gPomodoroUI.setCompleteCallback(handlePomodoroComplete);
 
     bootStep("WifiManager...", 6);
@@ -1760,6 +2332,12 @@ void loop() {
     }
 
     AppStateEnum state = AppState::instance().getState();
+    updateSharedServoMotion(now);
+
+    if (state == AppStateEnum::SERVO_TEST) {
+        updateServoTestFromImu(now);
+    }
+
     if (state == AppStateEnum::POMODORO) {
         gImuOrientation.update();
         PomoOrientation stable = gImuOrientation.getStable();

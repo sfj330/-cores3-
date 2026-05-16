@@ -55,7 +55,7 @@ void MusicUI::update() {
     if (!visible_ || !spriteReady_ || !dirty_) return;
 
     canvas_.fillSprite(UiTheme::BG);
-    UiTheme::drawTitle(canvas_, "Music", "SD WAV player", UiTheme::BLUE);
+    UiTheme::drawTitle(canvas_, "Music", "SD audio player", UiTheme::BLUE);
     drawBackButton();
     drawMusicIcon();
 

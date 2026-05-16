@@ -16,31 +16,35 @@ Implemented:
 
 - Animated face UI with 11 emotions: `NORMAL`, `HAPPY`, `CURIOUS`, `LISTENING`, `THINKING`, `SPEAKING`, `SURPRISED`, `SLEEPY`, `TRACKING`, `SHY`, `SICK`.
 - Touch gestures: tap, double tap, left/right swipe, long press.
-- Menu with Wi-Fi, Camera, Timer, Music, and System app icons.
+- Menu with Wi-Fi, Camera, Timer, Music, System, and Servo app icons.
 - Camera preview and JPEG capture to SD.
 - AI Vision preview and JPEG description request through a XiaoZhi-provided vision endpoint.
 - IMU orientation based Pomodoro timer with four presets and screen rotation.
 - SD WAV music player.
+- PCA9685 servo communication test through CoreS3 PortA, mapping IMU X/Y tilt to horizontal channel 0 and vertical channel 1 in a 10-170 degree test range.
+- Shared safe servo motion layer for Face touch/expression reactions, XiaoZhi pet reactions, and XiaoZhi `self.servo.control` commands.
+- Photo face-centering framework that can drive the servos from real `FaceResult` boxes when a real detector backend is added.
 - XiaoZhi OTA activation/config, TLS WebSocket, Opus mic upload, Opus TTS playback, MCP handshake, and MCP tools.
 - Wi-Fi auto reconnect, SD retry/fallback, and basic power/sleep handling.
 
 Not implemented or intentionally disabled:
 
 - Real local face detection. `FaceDetector` returns no detections and does not fake results.
-- PCA9685/servo base control. Config constants are reserved, but no servo controller is present.
+- PID gimbal tracking or autonomous base behavior. Current servo support is safe open-loop pose control plus a real-detector tracking hook, not autonomous motion.
 - Real battery voltage reading. `PowerManager::readVoltage()` is still a placeholder.
 - Full-duplex audio interruption or echo cancellation.
 
 ## State Machine
 
 - `FACE` - default expression page.
-- `MENU` - five-icon app menu.
+- `MENU` - six-icon app menu.
 - `WIFI_INFO` - Wi-Fi status page.
 - `CAMERA_DEBUG` - camera preview and SD photo capture.
 - `AI_VISION` - camera preview for XiaoZhi vision requests.
 - `POMODORO` - IMU selected timer.
 - `MUSIC` - SD WAV player.
 - `SYSTEM_INFO` - heap, PSRAM, power, and vision status page.
+- `SERVO_TEST` - PCA9685 communication and IMU tilt servo test page.
 - `AI` - XiaoZhi voice interaction page.
 - `SLEEP` - dim screen sleep page.
 
@@ -66,6 +70,9 @@ src/
 │   └── vision_client.h/.cpp
 ├── power/
 │   └── power_manager.h/.cpp
+├── servo/
+│   ├── servo_controller.h/.cpp
+│   └── servo_motion_controller.h/.cpp
 ├── storage/
 │   └── storage_manager.h/.cpp
 ├── ui/
@@ -75,11 +82,13 @@ src/
 │   ├── pomodoro_ui.h/.cpp
 │   ├── info_ui.h/.cpp
 │   ├── music_ui.h/.cpp
+│   ├── servo_test_ui.h/.cpp
 │   └── ui_theme.h
 └── vision/
     ├── camera_manager.h/.cpp
     ├── face_detector.h/.cpp
     ├── face_tracker.h/.cpp
+    ├── face_tracking_controller.h/.cpp
     └── imu_orientation.h/.cpp
 ```
 
@@ -90,21 +99,23 @@ src/
 | UI | Draw active screen with PSRAM canvas where possible | 20 FPS |
 | Touch | Read touch and emit gestures | 50 Hz |
 | Camera | Push camera frames to Camera Debug / AI Vision UI | 15 FPS |
-| Vision | Reserved local face detection/tracking loop | 5 FPS |
+| Vision | Reserved local face detection/tracking loop; feeds photo servo centering only when a real backend is available | 5 FPS |
 | AI | Process XiaoZhi WebSocket, activation, audio channel requests | 50 Hz tick |
 | Power | Battery/sleep status update | 1 Hz |
 | Network | Wi-Fi reconnect and menu status update | 5 s interval |
 | Music | Background WAV streaming task inside `MusicManager` | event-driven |
+| Servo Test | IMU tilt sampling and PCA9685 writes from the main loop while `SERVO_TEST` is active | 25 Hz max |
 
 ## Gesture Routing
 
-- Face: right swipe -> Menu; left swipe or double tap -> AI; tap top -> HAPPY; tap bottom -> SHY; tap left/right -> CURIOUS with gaze; long press -> Sleep.
+- Face: right swipe -> Menu; left swipe or double tap -> AI; tap top -> HAPPY + nod; tap bottom -> SHY + look down; tap left/right -> CURIOUS with gaze and pan servo; long press -> Sleep.
 - AI: single tap toggles listening; right swipe or long press -> Face.
 - Menu: tap app icon -> selected page; Back -> Face; left swipe -> Face.
-- Camera Debug: SHOT -> save JPEG to `/photos`; Back or left swipe -> Menu.
+- Camera Debug: SHOT -> optionally center a real detected face, then save JPEG to `/photos`; Back or left swipe -> Menu.
 - AI Vision: Back or left swipe -> close preview and return to AI.
 - Pomodoro: IMU orientation selects preset before start; Start/Pause/Reset buttons control timer; Back or left swipe -> Menu.
 - Music: Play/Pause, Stop, Next, Back; left swipe -> Menu.
+- Servo Test: Back or left swipe -> Menu; tap center area -> center servos; long press -> release PWM.
 - Sleep: tap or double tap -> Face.
 
 ## XiaoZhi AI Notes
@@ -120,7 +131,11 @@ src/
   - `self.camera.close`
   - `self.vision.describe_scene`
   - `self.pomodoro.open`
+  - `self.music.control`
+  - `self.pet.react`
+  - `self.servo.control`
 - AI Vision only works when the XiaoZhi MCP initialize params provide a vision URL/token.
+- `self.servo.control` supports `center`, `left`, `right`, `up`, `down`, `nod`, `shake`, and `release`. It must not switch pages or reopen the XiaoZhi audio channel.
 
 ## Face Detection Blocker
 
@@ -143,7 +158,8 @@ Likely future paths:
 - Keep camera framebuffer lifetime explicit: release frames after use and never use data after returning/freeing the framebuffer.
 - SD card handling must tolerate missing/flaky cards without rebooting. The retry sequence is 25, 10, 4, and 1 MHz.
 - Stop music before exclusive speaker/mic use by XiaoZhi AI or Pomodoro completion melody.
-- Do not claim local face recognition, servo control, or battery voltage measurement unless those paths are actually implemented and tested.
+- Do not claim local face recognition, closed-loop servo tracking, or battery voltage measurement unless those paths are actually implemented and tested.
+- Photo face tracking must report unavailable when `FaceDetector::backendAvailable()` is false; do not fake detections for demos.
 
 ## GitHub Hygiene
 

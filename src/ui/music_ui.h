@@ -37,7 +37,7 @@ private:
     bool visible_ = false;
     bool dirty_ = true;
 
-    String title_ = "No WAV file";
+    String title_ = "No audio file";
     String status_ = "No music";
     int index_ = -1;
     int count_ = 0;

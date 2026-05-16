@@ -13,8 +13,9 @@ constexpr AppLayout APP_LAYOUT[MenuUI::APP_COUNT] = {
     {58, 44},
     {160, 44},
     {262, 44},
-    {109, 130},
-    {211, 130}
+    {58, 130},
+    {160, 130},
+    {262, 130}
 };
 
 const char* appTitle(int index) {
@@ -24,6 +25,7 @@ const char* appTitle(int index) {
         case 2: return "Timer";
         case 3: return "Music";
         case 4: return "System";
+        case 5: return "Servo";
         default: return "";
     }
 }
@@ -35,6 +37,7 @@ uint16_t appAccent(int index, bool wifiConnected) {
         case 2: return UiTheme::AMBER;
         case 3: return UiTheme::BLUE;
         case 4: return UiTheme::GREEN;
+        case 5: return UiTheme::CYAN;
         default: return UiTheme::CYAN;
     }
 }
@@ -187,6 +190,18 @@ void MenuUI::drawAppIcon(int index, int x, int y, int size, uint16_t accent) {
                 int y2 = cy + static_cast<int>(sin(angle) * 22.0f);
                 canvas_.drawLine(x1, y1, x2, y2, fg);
             }
+            break;
+        case 5:
+            canvas_.fillRoundRect(x + 11, y + 20, size - 22, 14, 4, fg);
+            canvas_.drawRoundRect(x + 13, y + 22, size - 26, 10, 3, accent);
+            canvas_.fillCircle(cx, cy + 4, 9, accent);
+            canvas_.drawCircle(cx, cy + 4, 10, fg);
+            canvas_.drawLine(cx, cy + 4, x + 14, y + 12, fg);
+            canvas_.drawLine(cx, cy + 4, x + size - 13, y + 12, fg);
+            canvas_.drawLine(cx, cy + 4, cx, y + size - 10, fg);
+            canvas_.fillCircle(x + 14, y + 12, 3, fg);
+            canvas_.fillCircle(x + size - 13, y + 12, 3, fg);
+            canvas_.fillCircle(cx, y + size - 10, 3, fg);
             break;
     }
 }

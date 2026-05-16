@@ -99,12 +99,37 @@ constexpr const char* XIAOZHI_CHIP_ID = "esp32s3";
 constexpr const char* AI_SERVER_URL = "wss://api.xiaozhi.me/v1";
 constexpr int AI_AUDIO_SAMPLE_RATE = 16000;
 
-// ==================== Servo (reserved) ====================
+// ==================== Servo / PCA9685 ====================
 constexpr int PCA9685_I2C_ADDR = 0x40;
-constexpr int SERVO_PAN_MIN = 0;
-constexpr int SERVO_PAN_MAX = 180;
-constexpr int SERVO_TILT_MIN = 0;
-constexpr int SERVO_TILT_MAX = 180;
+constexpr uint32_t PCA9685_I2C_FREQ_HZ = 100000;
+constexpr int SERVO_PWM_FREQ_HZ = 50;
+constexpr int SERVO_PAN_CHANNEL = 0;
+constexpr int SERVO_TILT_CHANNEL = 1;
+constexpr int SERVO_MIN_PULSE_US = 600;
+constexpr int SERVO_MAX_PULSE_US = 2400;
+constexpr int SERVO_PAN_CENTER_DEG = 90;
+constexpr int SERVO_TILT_CENTER_DEG = 170;
+constexpr int SERVO_CENTER_DEG = SERVO_PAN_CENTER_DEG;
+constexpr int SERVO_SAFE_MIN_DEG = 10;
+constexpr int SERVO_SAFE_MAX_DEG = 170;
+constexpr bool SERVO_PAN_INVERT = false;
+constexpr bool SERVO_TILT_INVERT = false;
+constexpr float SERVO_TEST_SWEEP_DEG = 90.0f;
+constexpr float SERVO_TEST_FILTER_ALPHA = 0.18f;
+constexpr float SERVO_TEST_DEADBAND_DEG = 2.0f;
+constexpr float SERVO_TEST_MAX_SPEED_DPS = 90.0f;
+constexpr unsigned long SERVO_TEST_UPDATE_MS = 40;
+constexpr float SERVO_FACE_MOTION_SPEED_DPS = 45.0f;
+constexpr float SERVO_TRACKING_MOTION_SPEED_DPS = 35.0f;
+constexpr unsigned long SERVO_MOTION_UPDATE_MS = 40;
+constexpr unsigned long SERVO_MOTION_BEGIN_RETRY_MS = 3000;
+constexpr float SERVO_FACE_PAN_OFFSET_DEG = 24.0f;
+constexpr float SERVO_FACE_TILT_OFFSET_DEG = 18.0f;
+constexpr float SERVO_FACE_SMALL_TILT_DEG = 12.0f;
+constexpr float SERVO_FACE_TRACK_GAIN_DEG = 7.0f;
+constexpr float SERVO_FACE_TRACK_DEADBAND = 0.08f;
+constexpr float SERVO_FACE_TRACK_FILTER_ALPHA = 0.35f;
+constexpr unsigned long SERVO_PHOTO_TRACK_SETTLE_MS = 2000;
 
 // ==================== Task Priorities ====================
 constexpr bool SERIAL_DIAGNOSTIC_HEARTBEAT = false;

@@ -33,7 +33,10 @@ bool FaceDetector::backendAvailable() const {
 }
 
 const char* FaceDetector::statusText() const {
-    return "Face detection off";
+    if (!backendAvailable_) {
+        return "Face tracking unavailable";
+    }
+    return enabled_ ? "Face detection ready" : "Face detection disabled";
 }
 
 FaceResult FaceDetector::detect(const uint8_t* frameData, int width, int height) {
