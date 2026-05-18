@@ -30,6 +30,7 @@ public:
 
     void update(unsigned long now);
     void suspend();
+    void keepAlive(unsigned long now);
 
     bool command(ServoMotionAction action);
     bool release();
@@ -76,6 +77,7 @@ private:
     unsigned long nextSequenceStepAt_ = 0;
     unsigned long lastUpdate_ = 0;
     unsigned long lastBeginAttempt_ = 0;
+    unsigned long lastKeepAlive_ = 0;
 
     String status_ = "Servo motion idle";
 };

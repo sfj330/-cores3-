@@ -14,6 +14,7 @@ enum class AppStateEnum {
     SERVO_TEST,
     AFFINITY,
     AI,
+    SETTINGS,
     SLEEP
 };
 

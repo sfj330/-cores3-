@@ -15,7 +15,11 @@ void ImuOrientation::update() {
     float ax = 0, ay = 0, az = 0;
     M5.Imu.getAccel(&ax, &ay, &az);
 
+    float gx = 0, gy = 0, gz = 0;
+    M5.Imu.getGyro(&gx, &gy, &gz);
+
     updateShakeDetection(ax, ay, az);
+    updateTwistDetection(gz);
 
     PomoOrientation detected = PomoOrientation::UNKNOWN;
 
@@ -114,5 +118,24 @@ void ImuOrientation::updateShakeDetection(float ax, float ay, float az) {
         lastShakeTime_ = now;
     } else {
         shaking_ = false;
+    }
+}
+
+TwistDirection ImuOrientation::consumeTwist() {
+    TwistDirection t = pendingTwist_;
+    pendingTwist_ = TwistDirection::NONE;
+    return t;
+}
+
+void ImuOrientation::updateTwistDetection(float gz) {
+    unsigned long now = millis();
+    if (now - lastTwistTime_ < TWIST_COOLDOWN_MS) return;
+
+    if (gz > TWIST_THRESHOLD_DPS) {
+        pendingTwist_ = TwistDirection::CLOCKWISE;
+        lastTwistTime_ = now;
+    } else if (gz < -TWIST_THRESHOLD_DPS) {
+        pendingTwist_ = TwistDirection::COUNTER_CLOCKWISE;
+        lastTwistTime_ = now;
     }
 }

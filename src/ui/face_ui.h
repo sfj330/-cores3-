@@ -4,6 +4,19 @@
 #include <M5GFX.h>
 #include "config/app_config.h"
 
+static constexpr int MAX_PARTICLES = 10;
+
+struct Particle {
+    float x, y;
+    float vx, vy;
+    float life;
+    float maxLife;
+    uint16_t color;
+    uint8_t size;
+    uint8_t shape; // 0=circle, 1=star, 2=heart, 3=letter
+    char letter;
+};
+
 class FaceUI {
 public:
     FaceUI();
@@ -27,6 +40,11 @@ private:
     void drawMouth(int centerX, int centerY);
     void drawCheeks(int centerX, int centerY);
     void drawStatusText();
+    void updateParticles();
+    void drawParticles();
+    void spawnParticles(int emotion);
+    void drawStar(int cx, int cy, int r, uint16_t color);
+    void drawHeart(int cx, int cy, int size, uint16_t color);
 
     void updateBlink();
     void updateGaze();
@@ -61,4 +79,8 @@ private:
     String statusText_;
     uint16_t statusColor_ = 0x7BEF;
     unsigned long statusEndTime_ = 0;
+
+    Particle particles_[MAX_PARTICLES] = {};
+    unsigned long lastParticleSpawn_ = 0;
+    int lastParticleEmotion_ = -1;
 };

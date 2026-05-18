@@ -126,6 +126,8 @@ void FaceUI::drawFace() {
     drawEyebrows(cx, cy);
     drawMouth(cx, cy);
     drawCheeks(cx, cy);
+    updateParticles();
+    drawParticles();
     drawStatusText();
 }
 
@@ -410,4 +412,144 @@ void FaceUI::drawCheeks(int cx, int cy) {
         canvas_.fillCircle(leftCheekX, cheekY, 10, 0x37E0);
         canvas_.fillCircle(rightCheekX, cheekY, 10, 0x37E0);
     }
+}
+
+void FaceUI::spawnParticles(int emotion) {
+    FaceEmotion em = static_cast<FaceEmotion>(emotion);
+    unsigned long now = millis();
+    if (now - lastParticleSpawn_ < 400) return;
+    lastParticleSpawn_ = now;
+
+    for (int i = 0; i < MAX_PARTICLES; ++i) {
+        if (particles_[i].life > 0) continue;
+
+        Particle& p = particles_[i];
+        p.maxLife = 1.0f;
+        p.life = 1.0f;
+
+        switch (em) {
+            case FaceEmotion::HAPPY:
+                p.x = FACE_CENTER_X + random(-80, 80);
+                p.y = FACE_CENTER_Y + random(-60, 40);
+                p.vx = random(-10, 10) / 10.0f;
+                p.vy = -random(5, 15) / 10.0f;
+                p.color = 0xFFE0;
+                p.size = random(2, 5);
+                p.shape = 1;
+                break;
+            case FaceEmotion::SHY:
+                p.x = FACE_CENTER_X + random(-60, 60);
+                p.y = FACE_CENTER_Y + random(-40, 20);
+                p.vx = random(-5, 5) / 10.0f;
+                p.vy = -random(3, 10) / 10.0f;
+                p.color = 0xF81F;
+                p.size = random(3, 6);
+                p.shape = 2;
+                break;
+            case FaceEmotion::SLEEPY:
+                p.x = FACE_CENTER_X + 50 + random(0, 30);
+                p.y = FACE_CENTER_Y - 20 + random(-10, 10);
+                p.vx = random(2, 8) / 10.0f;
+                p.vy = -random(5, 12) / 10.0f;
+                p.color = 0x7BEF;
+                p.size = random(1, 3);
+                p.shape = 3;
+                p.letter = 'Z';
+                break;
+            case FaceEmotion::SICK:
+                p.x = FACE_CENTER_X + random(-50, 50);
+                p.y = FACE_CENTER_Y + 30 + random(0, 20);
+                p.vx = random(-8, 8) / 10.0f;
+                p.vy = -random(3, 8) / 10.0f;
+                p.color = 0x37E0;
+                p.size = random(3, 6);
+                p.shape = 0;
+                break;
+            case FaceEmotion::SURPRISED:
+                p.x = FACE_CENTER_X + random(-90, 90);
+                p.y = FACE_CENTER_Y + random(-70, 50);
+                p.vx = random(-15, 15) / 10.0f;
+                p.vy = random(-15, 15) / 10.0f;
+                p.color = 0xFFFF;
+                p.size = random(1, 3);
+                p.shape = 1;
+                break;
+            default:
+                return;
+        }
+        break;
+    }
+}
+
+void FaceUI::updateParticles() {
+    FaceEmotion em = static_cast<FaceEmotion>(currentEmotion_);
+    if (em == FaceEmotion::HAPPY || em == FaceEmotion::SHY ||
+        em == FaceEmotion::SLEEPY || em == FaceEmotion::SICK ||
+        em == FaceEmotion::SURPRISED) {
+        spawnParticles(currentEmotion_);
+    }
+
+    for (int i = 0; i < MAX_PARTICLES; ++i) {
+        Particle& p = particles_[i];
+        if (p.life <= 0) continue;
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life -= 0.02f;
+        if (p.life < 0) p.life = 0;
+    }
+}
+
+void FaceUI::drawParticles() {
+    for (int i = 0; i < MAX_PARTICLES; ++i) {
+        Particle& p = particles_[i];
+        if (p.life <= 0) continue;
+
+        uint8_t alpha = (uint8_t)(p.life * 255);
+        uint16_t color = p.color;
+        if (alpha < 128) {
+            uint8_t r = ((color >> 11) & 0x1F) * alpha / 255;
+            uint8_t g = ((color >> 5) & 0x3F) * alpha / 255;
+            uint8_t b = (color & 0x1F) * alpha / 255;
+            color = (r << 11) | (g << 5) | b;
+        }
+
+        int px = (int)p.x;
+        int py = (int)p.y;
+
+        switch (p.shape) {
+            case 0:
+                canvas_.fillCircle(px, py, p.size, color);
+                break;
+            case 1:
+                drawStar(px, py, p.size, color);
+                break;
+            case 2:
+                drawHeart(px, py, p.size, color);
+                break;
+            case 3:
+                canvas_.setTextSize(p.size);
+                canvas_.setTextColor(color);
+                canvas_.drawChar(p.letter, px, py);
+                canvas_.setTextSize(1);
+                break;
+        }
+    }
+}
+
+void FaceUI::drawStar(int cx, int cy, int r, uint16_t color) {
+    for (int i = 0; i < 4; ++i) {
+        float angle = i * 3.14159f / 2.0f;
+        int ex = cx + (int)(cos(angle) * r);
+        int ey = cy + (int)(sin(angle) * r);
+        canvas_.drawLine(cx, cy, ex, ey, color);
+    }
+    canvas_.fillCircle(cx, cy, r > 2 ? 1 : 0, color);
+}
+
+void FaceUI::drawHeart(int cx, int cy, int size, uint16_t color) {
+    int s = size / 2;
+    if (s < 1) s = 1;
+    canvas_.fillCircle(cx - s, cy - s, s, color);
+    canvas_.fillCircle(cx + s, cy - s, s, color);
+    canvas_.fillTriangle(cx - size, cy, cx + size, cy, cx, cy + size, color);
 }

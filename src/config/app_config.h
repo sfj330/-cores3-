@@ -56,14 +56,14 @@ constexpr int TOUCH_SAMPLING_HZ = 50;
 constexpr int CAMERA_FRAME_WIDTH = 320;
 constexpr int CAMERA_FRAME_HEIGHT = 240;
 constexpr int CAMERA_FPS = 15;
-constexpr bool CAMERA_INIT_ON_BOOT = false;    // Keep boot path stable; init camera on demand.
+constexpr bool CAMERA_INIT_ON_BOOT = false;
 constexpr int CAMERA_JPEG_QUALITY = 85;
 
 // ==================== Face Detection ====================
 constexpr int DETECTION_FRAME_WIDTH = CAMERA_FRAME_WIDTH;
 constexpr int DETECTION_FRAME_HEIGHT = CAMERA_FRAME_HEIGHT;
 constexpr int DETECTION_FPS = 5;
-constexpr bool FACE_DETECTION_ENABLED_ON_BOOT = false;
+constexpr bool FACE_DETECTION_ENABLED_ON_BOOT = true;
 constexpr int FACE_TRACKING_TIMEOUT_MS = 3000;  // No face -> NORMAL after this
 constexpr unsigned long SICK_EMOTION_DURATION_MS = 2000;
 

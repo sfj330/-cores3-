@@ -11,6 +11,12 @@ enum class PomoOrientation {
     UNKNOWN
 };
 
+enum class TwistDirection {
+    NONE,
+    CLOCKWISE,
+    COUNTER_CLOCKWISE
+};
+
 class ImuOrientation {
 public:
     ImuOrientation();
@@ -21,6 +27,7 @@ public:
     PomoOrientation getCurrent() const;
     PomoOrientation getStable() const;
     bool isShaking() const;
+    TwistDirection consumeTwist();
 
     static const char* orientationName(PomoOrientation o);
 
@@ -43,5 +50,12 @@ private:
     bool shaking_ = false;
     unsigned long lastShakeTime_ = 0;
 
+    // Gyro twist detection
+    static constexpr float TWIST_THRESHOLD_DPS = 120.0f;
+    static constexpr unsigned long TWIST_COOLDOWN_MS = 800;
+    TwistDirection pendingTwist_ = TwistDirection::NONE;
+    unsigned long lastTwistTime_ = 0;
+
     void updateShakeDetection(float ax, float ay, float az);
+    void updateTwistDetection(float gz);
 };

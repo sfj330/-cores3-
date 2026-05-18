@@ -1165,6 +1165,8 @@ void XiaoZhiClient::deinitOpusCodec() {
 
 void XiaoZhiClient::audioCaptureTask() {
     Serial.println("XiaoZhi: audio capture task started");
+    unsigned long lastDebugPrint = 0;
+    int framesSent = 0;
     while (true) {
         if (!audioCaptureRunning_ || !wsConnected_) {
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -1174,7 +1176,15 @@ void XiaoZhiClient::audioCaptureTask() {
         if (micActive_ && M5.Mic.isRunning()) {
             size_t readLen = AUDIO_FRAME_SAMPLES;
             if (M5.Mic.record(pcmCaptureBuf_, readLen, AUDIO_SAMPLE_RATE, false)) {
-                sendAudioFrame(pcmCaptureBuf_, readLen);
+                if (sendAudioFrame(pcmCaptureBuf_, readLen)) {
+                    framesSent++;
+                }
+            }
+            unsigned long now = millis();
+            if (now - lastDebugPrint > 5000) {
+                Serial.printf("XiaoZhi: audio frames sent=%d mic=%d\n", framesSent, micActive_);
+                framesSent = 0;
+                lastDebugPrint = now;
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(10));

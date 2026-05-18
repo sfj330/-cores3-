@@ -98,6 +98,14 @@ void ServoMotionController::suspend() {
     status_ = "Servo motion suspended";
 }
 
+void ServoMotionController::keepAlive(unsigned long now) {
+    if (servo_ == nullptr || !servo_->isReady() || servo_->isReleased()) return;
+    if (active_ || sequence_ != Sequence::NONE) return;
+    if (now - lastKeepAlive_ < 5000) return;
+    lastKeepAlive_ = now;
+    servo_->setPanTilt(currentPan_, currentTilt_);
+}
+
 bool ServoMotionController::command(ServoMotionAction action) {
     switch (action) {
         case ServoMotionAction::CENTER:

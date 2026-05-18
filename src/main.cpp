@@ -19,6 +19,7 @@
 #include "ui/music_ui.h"
 #include "ui/servo_test_ui.h"
 #include "ui/affinity_ui.h"
+#include "ui/settings_ui.h"
 #include "ui/ui_theme.h"
 #include "audio/music_manager.h"
 #include "servo/servo_controller.h"
@@ -43,6 +44,7 @@ InfoUI gInfoUI;
 MusicUI gMusicUI;
 ServoTestUI gServoTestUI;
 AffinityUI gAffinityUI;
+SettingsUI gSettingsUI;
 CameraManager gCameraManager;
 FaceDetector gFaceDetector;
 FaceTracker gFaceTracker;
@@ -73,6 +75,9 @@ static SemaphoreHandle_t displayMutex = nullptr;
 
 static bool gSickActive = false;
 static unsigned long gSickUntil = 0;
+static int gShakeCount = 0;
+static unsigned long gLastShakeTime = 0;
+static bool gNtpSynced = false;
 static volatile bool gNeedActivationRequest = false;
 static volatile bool gNeedActivationCheck = false;
 static volatile bool gNeedOpenAudioChannel = false;
@@ -787,7 +792,7 @@ static void updateSharedServoMotion(unsigned long now) {
     }
 
     if (gFaceTrackCorrectionPending &&
-        (state == AppStateEnum::CAMERA_DEBUG || state == AppStateEnum::AI_VISION)) {
+        (state == AppStateEnum::FACE || state == AppStateEnum::CAMERA_DEBUG || state == AppStateEnum::AI_VISION)) {
         float panDelta = gFaceTrackPanDeltaDeg;
         float tiltDelta = gFaceTrackTiltDeltaDeg;
         gFaceTrackCorrectionPending = false;
@@ -871,7 +876,27 @@ static void updateCompanionMotion(unsigned long now) {
     unsigned long interval = affinity >= 75 ? 4500 : (affinity >= 50 ? 6500 : 9000);
     gNextCompanionMotionAt = now + interval + random(0, 1800);
 
-    int pattern = random(0, affinity >= 75 ? 4 : 3);
+    // Time-aware behavior: occasionally show time-appropriate emotion
+    if (gNtpSynced && random(0, 8) == 0) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 0)) {
+            int hour = timeinfo.tm_hour;
+            if (hour >= 23 || hour < 6) {
+                AppState::instance().setEmotion(FaceEmotion::SLEEPY);
+                gFaceUI.setTemporaryGaze(0.0f, 0.3f, 2000);
+                gServoMotionController.lookOffset(0.0f, 12.0f, 22.0f, "Sleepy time");
+                gSickActive = true;
+                gSickUntil = now + 3000;
+                return;
+            } else if (hour >= 6 && hour < 9) {
+                AppState::instance().setEmotion(FaceEmotion::HAPPY);
+                gServoMotionController.command(ServoMotionAction::NOD);
+                return;
+            }
+        }
+    }
+
+    int pattern = random(0, affinity >= 75 ? 6 : (affinity >= 50 ? 4 : 3));
     if (pattern == 0) {
         float pan = random(0, 2) == 0 ? -8.0f : 8.0f;
         gFaceUI.setTemporaryGaze(pan < 0 ? -0.45f : 0.45f, -0.05f, 1100);
@@ -882,8 +907,22 @@ static void updateCompanionMotion(unsigned long now) {
     } else if (pattern == 2) {
         gFaceUI.setTemporaryGaze(0.0f, 0.18f, 900);
         gServoMotionController.lookOffset(0.0f, 4.0f, 28.0f, "Companion dip");
-    } else {
+    } else if (pattern == 3) {
         gServoMotionController.command(ServoMotionAction::NOD);
+    } else if (pattern == 4) {
+        // High affinity: playful head tilt
+        AppState::instance().setEmotion(FaceEmotion::CURIOUS);
+        gFaceUI.setTemporaryGaze(0.6f, -0.2f, 1500);
+        gServoMotionController.lookOffset(12.0f, -4.0f, 32.0f, "Playful tilt");
+        gSickActive = true;
+        gSickUntil = now + 1800;
+    } else {
+        // High affinity: happy wiggle
+        AppState::instance().setEmotion(FaceEmotion::HAPPY);
+        gServoMotionController.command(ServoMotionAction::SHAKE);
+        M5.Speaker.tone(1400, 40);
+        gSickActive = true;
+        gSickUntil = now + 2000;
     }
 }
 
@@ -1004,23 +1043,29 @@ static void handleFaceTap(int x, int y) {
         appState.setEmotion(FaceEmotion::HAPPY);
         gFaceUI.setTemporaryGaze(0.0f, -0.5f, 1500);
         gServoMotionController.command(ServoMotionAction::NOD);
+        M5.Speaker.tone(1400, 60);
+        delay(70);
+        M5.Speaker.tone(1800, 60);
     } else if (y > cy + cy / 2) {
         appState.setEmotion(FaceEmotion::SHY);
         gFaceUI.setTemporaryGaze(0.0f, 0.5f, 1500);
         gServoMotionController.lookOffset(-10.0f, SERVO_FACE_TILT_OFFSET_DEG,
                                           SERVO_FACE_MOTION_SPEED_DPS, "Face tap shy");
+        M5.Speaker.tone(600, 100);
     } else if (x < cx) {
         gFaceUI.setTemporaryGaze(-1.0f, 0.0f, 1200);
         gServoMotionController.command(ServoMotionAction::LEFT);
         if (appState.getEmotion() != FaceEmotion::TRACKING) {
             appState.setEmotion(FaceEmotion::CURIOUS);
         }
+        M5.Speaker.tone(1000, 50);
     } else {
         gFaceUI.setTemporaryGaze(1.0f, 0.0f, 1200);
         gServoMotionController.command(ServoMotionAction::RIGHT);
         if (appState.getEmotion() != FaceEmotion::TRACKING) {
             appState.setEmotion(FaceEmotion::CURIOUS);
         }
+        M5.Speaker.tone(1100, 50);
     }
     gLastServoPoseEmotion = appState.getEmotion();
 }
@@ -1082,6 +1127,10 @@ void uiTask(void* pvParameters) {
                     updateAiStatusText();
                     gFaceUI.setExpression(static_cast<int>(emotion));
                     gFaceUI.update();
+                    break;
+
+                case AppStateEnum::SETTINGS:
+                    gSettingsUI.update();
                     break;
 
                 case AppStateEnum::SLEEP:
@@ -1182,6 +1231,19 @@ void visionTask(void* pvParameters) {
                         }
                     }
 
+                    if (state == AppStateEnum::FACE && face.detected) {
+                        float normX = (float)(face.centerX - frameWidth / 2) / (float)(frameWidth / 2);
+                        float normY = (float)(face.centerY - frameHeight / 2) / (float)(frameHeight / 2);
+                        float panDelta = -normX * SERVO_FACE_TRACK_GAIN_DEG;
+                        float tiltDelta = normY * SERVO_FACE_TRACK_GAIN_DEG * 0.6f;
+                        if (fabsf(normX) > SERVO_FACE_TRACK_DEADBAND ||
+                            fabsf(normY) > SERVO_FACE_TRACK_DEADBAND) {
+                            gFaceTrackPanDeltaDeg = panDelta;
+                            gFaceTrackTiltDeltaDeg = tiltDelta;
+                            gFaceTrackCorrectionPending = true;
+                        }
+                    }
+
                     if (gFaceTracker.hasFace()) {
                         gFaceUI.setGazeOffset(gFaceTracker.getGazeX(), gFaceTracker.getGazeY());
 
@@ -1274,6 +1336,15 @@ void networkTask(void* pvParameters) {
 
     while (true) {
         gWifiManager.update();
+
+        if (!gNtpSynced && gWifiManager.isConnected()) {
+            configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo, 3000)) {
+                gNtpSynced = true;
+                Serial.printf("NTP synced: %02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min);
+            }
+        }
 
         if (AppState::instance().getState() == AppStateEnum::MENU) {
             gMenuUI.setWifiStatus(gWifiManager.statusText().c_str(), gWifiManager.ipString().c_str());
@@ -2395,6 +2466,11 @@ static void gestureEventHandler(const GestureEvent& event) {
                     updateAffinityUiData();
                     appState.setState(AppStateEnum::AFFINITY);
                     break;
+                case GestureType::UP_SWIPE:
+                    gSettingsUI.setBrightness(static_cast<int>(gUserBrightnessLevel));
+                    gSettingsUI.setVolume(static_cast<int>(gUserVolumeLevel));
+                    appState.setState(AppStateEnum::SETTINGS);
+                    break;
                 case GestureType::SINGLE_TAP:
                     handleFaceTap(event.endX, event.endY);
                     break;
@@ -2649,6 +2725,52 @@ static void gestureEventHandler(const GestureEvent& event) {
             break;
         }
 
+        case AppStateEnum::SETTINGS: {
+            if (event.type == GestureType::LEFT_SWIPE ||
+                event.type == GestureType::DOWN_SWIPE) {
+                appState.setState(AppStateEnum::FACE);
+                break;
+            }
+            if (event.type == GestureType::SINGLE_TAP) {
+                SettingsHitZone hit = gSettingsUI.hitTest(event.endX, event.endY);
+                switch (hit) {
+                    case SettingsHitZone::BACK:
+                        appState.setState(AppStateEnum::FACE);
+                        break;
+                    case SettingsHitZone::BRIGHTNESS_DIM:
+                        applyBrightnessLevel(SystemBrightnessLevel::DIM);
+                        gSettingsUI.setBrightness(0);
+                        break;
+                    case SettingsHitZone::BRIGHTNESS_NORMAL:
+                        applyBrightnessLevel(SystemBrightnessLevel::NORMAL);
+                        gSettingsUI.setBrightness(1);
+                        break;
+                    case SettingsHitZone::BRIGHTNESS_BRIGHT:
+                        applyBrightnessLevel(SystemBrightnessLevel::BRIGHT);
+                        gSettingsUI.setBrightness(2);
+                        break;
+                    case SettingsHitZone::VOLUME_QUIET:
+                        applyVolumeLevel(SystemVolumeLevel::QUIET);
+                        gSettingsUI.setVolume(0);
+                        M5.Speaker.tone(800, 80);
+                        break;
+                    case SettingsHitZone::VOLUME_NORMAL:
+                        applyVolumeLevel(SystemVolumeLevel::NORMAL);
+                        gSettingsUI.setVolume(1);
+                        M5.Speaker.tone(1000, 80);
+                        break;
+                    case SettingsHitZone::VOLUME_LOUD:
+                        applyVolumeLevel(SystemVolumeLevel::LOUD);
+                        gSettingsUI.setVolume(2);
+                        M5.Speaker.tone(1200, 80);
+                        break;
+                    default:
+                        break;
+                }
+            }
+            break;
+        }
+
         case AppStateEnum::SLEEP:
             switch (event.type) {
                 case GestureType::SINGLE_TAP:
@@ -2679,8 +2801,19 @@ static void stateChangeHandler(AppStateEnum state) {
     if (state != AppStateEnum::CAMERA_DEBUG && state != AppStateEnum::AI_VISION) {
         gPhotoFaceTrackingActive = false;
     }
+    if (state != AppStateEnum::FACE &&
+        state != AppStateEnum::CAMERA_DEBUG &&
+        state != AppStateEnum::AI_VISION) {
+        gFaceDetector.setEnabled(false);
+        if (gCameraManager.isRunning()) {
+            gCameraManager.stopCapture();
+        }
+    }
     if (state != AppStateEnum::AFFINITY) {
         gAffinityUI.hide();
+    }
+    if (state != AppStateEnum::SETTINGS) {
+        gSettingsUI.hide();
     }
 
     switch (state) {
@@ -2734,6 +2867,11 @@ static void stateChangeHandler(AppStateEnum state) {
             gInfoUI.hide();
             gMusicUI.hide();
             stopMusicForExclusiveAudio();
+            gFaceDetector.setEnabled(false);
+            if (gCameraManager.isInitialized()) {
+                gCameraManager.end();
+                Serial.println("AI: camera deinit for mic");
+            }
             gFaceUI.clearStatusText();
             gPetReactActive = false;
             gAiListeningAffinityAwarded = false;
@@ -2820,9 +2958,12 @@ static void stateChangeHandler(AppStateEnum state) {
             if (gFaceDetector.backendAvailable()) {
                 gFaceDetector.setEnabled(true);
             }
-            if (!gCameraManager.isRunning()) {
-                bool cameraReady = gCameraManager.isInitialized() || gCameraManager.begin();
-                cameraReady = cameraReady && gCameraManager.startCapture();
+            {
+                bool cameraReady = gCameraManager.isRunning();
+                if (!cameraReady) {
+                    cameraReady = gCameraManager.isInitialized() || gCameraManager.begin();
+                    cameraReady = cameraReady && gCameraManager.startCapture();
+                }
                 gCameraDebugUI.setCameraReady(cameraReady);
                 Serial.println(cameraReady ? "Camera debug started" : "Camera debug start failed");
             }
@@ -2863,13 +3004,16 @@ static void stateChangeHandler(AppStateEnum state) {
             gServoTestReadyForUpdates = false;
             gServoTestTrackingEnabled = true;
             resetServoTestControl();
-            bool servoReady = gServoController.begin();
+            bool servoReady = gServoController.isReady();
+            if (!servoReady) {
+                servoReady = gServoController.begin();
+            }
             if (servoReady) {
                 gServoMotionController.ensureReady();
                 gServoMotionController.lookOffset(
                     static_cast<float>(SERVO_TEST_PAN_CENTER_DEG - SERVO_PAN_CENTER_DEG),
                     static_cast<float>(SERVO_TEST_TILT_CENTER_DEG - SERVO_TILT_CENTER_DEG),
-                    SERVO_TEST_TRANSITION_SPEED_DPS,
+                    SERVO_SAFE_CENTER_SPEED_DPS,
                     "Servo test transition");
             }
             gServoTestInputEnableAt = millis() + SERVO_TEST_INPUT_ENABLE_DELAY_MS;
@@ -2895,6 +3039,15 @@ static void stateChangeHandler(AppStateEnum state) {
             gMusicUI.hide();
             updateAffinityUiData();
             gAffinityUI.show();
+            break;
+
+        case AppStateEnum::SETTINGS:
+            gMenuUI.hide();
+            gCameraDebugUI.hide();
+            gPomodoroUI.hide();
+            gInfoUI.hide();
+            gMusicUI.hide();
+            gSettingsUI.show();
             break;
 
         case AppStateEnum::SLEEP:
@@ -3097,6 +3250,7 @@ void setup() {
     gMusicUI.begin();
     gServoTestUI.begin();
     gAffinityUI.begin();
+    gSettingsUI.begin();
     gServoMotionController.attach(gServoController);
     gPomodoroUI.setCompleteCallback(handlePomodoroComplete);
 
@@ -3143,6 +3297,57 @@ void setup() {
     EventBus::instance().subscribe(EventType::FACE_LOST, handleEvent);
 
     bootStep("Creating tasks...", 14);
+
+    // Boot animation: eyes opening
+    {
+        M5Canvas bootCanvas(&M5.Lcd);
+        bootCanvas.setPsram(true);
+        bootCanvas.setColorDepth(16);
+        if (bootCanvas.createSprite(DISPLAY_WIDTH, DISPLAY_HEIGHT)) {
+            int cx = DISPLAY_WIDTH / 2;
+            int cy = DISPLAY_HEIGHT / 2;
+            int eyeSpacing = 70;
+            int leftX = cx - eyeSpacing / 2;
+            int rightX = cx + eyeSpacing / 2;
+
+            for (int frame = 0; frame <= 8; ++frame) {
+                bootCanvas.fillSprite(UiTheme::BG);
+                int openH = frame * 7;
+                if (openH > 0) {
+                    int eyeR = 25;
+                    bootCanvas.fillCircle(leftX, cy, eyeR, TFT_WHITE);
+                    bootCanvas.fillCircle(rightX, cy, eyeR, TFT_WHITE);
+                    int clipH = eyeR - openH / 2;
+                    if (clipH > 0) {
+                        bootCanvas.fillRect(leftX - eyeR - 1, cy - eyeR - 1, eyeR * 2 + 2, clipH, UiTheme::BG);
+                        bootCanvas.fillRect(leftX - eyeR - 1, cy + eyeR - clipH + 1, eyeR * 2 + 2, clipH, UiTheme::BG);
+                        bootCanvas.fillRect(rightX - eyeR - 1, cy - eyeR - 1, eyeR * 2 + 2, clipH, UiTheme::BG);
+                        bootCanvas.fillRect(rightX - eyeR - 1, cy + eyeR - clipH + 1, eyeR * 2 + 2, clipH, UiTheme::BG);
+                    }
+                    if (frame >= 4) {
+                        int pupilR = (frame - 4) * 3;
+                        if (pupilR > 12) pupilR = 12;
+                        bootCanvas.fillCircle(leftX, cy, pupilR, TFT_BLACK);
+                        bootCanvas.fillCircle(rightX, cy, pupilR, TFT_BLACK);
+                        if (pupilR > 4) {
+                            bootCanvas.fillCircle(leftX - 3, cy - 3, 2, TFT_WHITE);
+                            bootCanvas.fillCircle(rightX - 3, cy - 3, 2, TFT_WHITE);
+                        }
+                    }
+                }
+                bootCanvas.pushSprite(0, 0);
+                delay(80);
+            }
+            bootCanvas.deleteSprite();
+        }
+        M5.Speaker.tone(800, 80);
+        delay(100);
+        M5.Speaker.tone(1200, 80);
+        delay(100);
+        M5.Speaker.tone(1600, 100);
+        delay(150);
+    }
+
     createTaskChecked(uiTask, "UI", UI_TASK_STACK_SIZE, UI_TASK_PRIORITY, &uiTaskHandle, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     createTaskChecked(touchTask, "Touch", TOUCH_TASK_STACK_SIZE, TOUCH_TASK_PRIORITY, &touchTaskHandle, 1);
@@ -3178,6 +3383,7 @@ void loop() {
 
     AppStateEnum state = AppState::instance().getState();
     updateSharedServoMotion(now);
+    gServoMotionController.keepAlive(now);
     updateDanceLifecycle(now);
     updateCompanionMotion(now);
 
@@ -3199,14 +3405,62 @@ void loop() {
         gPomodoroUI.setOrientation(stable);
     }
 
+    if (state == AppStateEnum::SLEEP) {
+        gImuOrientation.update();
+        if (gImuOrientation.isShaking()) {
+            AppState::instance().setState(AppStateEnum::FACE);
+            if (takeDisplayLock()) {
+                wakeFromSleepMode();
+                gFaceUI.wake();
+                giveDisplayLock();
+            }
+            AppState::instance().setEmotion(FaceEmotion::SURPRISED);
+            gSickActive = true;
+            gSickUntil = now + 1500;
+            M5.Speaker.tone(800, 100);
+            Serial.println("Shake wake from sleep");
+        }
+    }
+
     if (state == AppStateEnum::FACE) {
         gImuOrientation.update();
         if (gImuOrientation.isShaking()) {
-            AppState::instance().setEmotion(FaceEmotion::SICK);
-            gFaceUI.setTemporaryGaze(0.0f, 0.3f, 2000);
+            if (now - gLastShakeTime > 5000) gShakeCount = 0;
+            gShakeCount++;
+            gLastShakeTime = now;
+
+            if (gShakeCount >= 3) {
+                AppState::instance().setEmotion(FaceEmotion::SICK);
+                gFaceUI.setTemporaryGaze(0.0f, 0.3f, 2000);
+                gServoMotionController.command(ServoMotionAction::SHAKE);
+                addAffinity(-1, "shaken too hard");
+                Serial.println("Shake x3 -> SICK, affinity -1");
+            } else {
+                AppState::instance().setEmotion(FaceEmotion::SURPRISED);
+                gFaceUI.setTemporaryGaze(0.0f, -0.3f, 1500);
+                gServoMotionController.command(ServoMotionAction::NOD);
+                M5.Speaker.tone(1200, 80);
+                Serial.println("Shake -> SURPRISED");
+            }
             gSickActive = true;
             gSickUntil = now + SICK_EMOTION_DURATION_MS;
-            Serial.println("Shake detected -> SICK");
+        }
+
+        TwistDirection twist = gImuOrientation.consumeTwist();
+        if (twist == TwistDirection::CLOCKWISE) {
+            AppState::instance().setEmotion(FaceEmotion::CURIOUS);
+            gFaceUI.setTemporaryGaze(0.8f, 0.0f, 1200);
+            gServoMotionController.command(ServoMotionAction::RIGHT);
+            M5.Speaker.tone(1100, 40);
+            gSickActive = true;
+            gSickUntil = now + 1500;
+        } else if (twist == TwistDirection::COUNTER_CLOCKWISE) {
+            AppState::instance().setEmotion(FaceEmotion::CURIOUS);
+            gFaceUI.setTemporaryGaze(-0.8f, 0.0f, 1200);
+            gServoMotionController.command(ServoMotionAction::LEFT);
+            M5.Speaker.tone(900, 40);
+            gSickActive = true;
+            gSickUntil = now + 1500;
         }
 
         if (gSickActive && now >= gSickUntil) {
@@ -3229,6 +3483,16 @@ void loop() {
             if (current == FaceEmotion::HAPPY || current == FaceEmotion::SHY) {
                 AppState::instance().setEmotion(FaceEmotion::NORMAL);
             }
+        }
+    }
+
+    if (state == AppStateEnum::MUSIC) {
+        gImuOrientation.update();
+        TwistDirection twist = gImuOrientation.consumeTwist();
+        if (twist == TwistDirection::CLOCKWISE) {
+            gMusicManager.next();
+            updateMusicUiData();
+            gMusicUI.markDirty();
         }
     }
 

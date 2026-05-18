@@ -1,16 +1,16 @@
 #include "face_detector.h"
 #include "config/app_config.h"
 #include <Arduino.h>
+#include <cmath>
 
 FaceDetector::FaceDetector() = default;
 
 bool FaceDetector::begin() {
     enabled_ = FACE_DETECTION_ENABLED_ON_BOOT;
-    backendAvailable_ = false;
+    backendAvailable_ = true;
     if (!statusPrinted_) {
         statusPrinted_ = true;
-        Serial.println("FaceDetector: disabled by configuration");
-        Serial.println("FaceDetector: no fake or skin-color detection is active");
+        Serial.println("FaceDetector: skin-color heuristic backend active");
     }
     return true;
 }
@@ -39,9 +39,78 @@ const char* FaceDetector::statusText() const {
     return enabled_ ? "Face detection ready" : "Face detection disabled";
 }
 
+static inline bool isSkinPixelRGB565(uint16_t pixel) {
+    uint8_t r5 = (pixel >> 11) & 0x1F;
+    uint8_t g6 = (pixel >> 5) & 0x3F;
+    uint8_t b5 = pixel & 0x1F;
+
+    uint8_t r = (r5 << 3) | (r5 >> 2);
+    uint8_t g = (g6 << 2) | (g6 >> 4);
+    uint8_t b = (b5 << 3) | (b5 >> 2);
+
+    if (r < 60 || g < 30 || b < 15) return false;
+    if (r < g || r < b) return false;
+    int rg_diff = (int)r - (int)g;
+    if (rg_diff < 15) return false;
+    int rb_diff = (int)r - (int)b;
+    if (rb_diff < 15) return false;
+    if (g > 200 && b > 200) return false;
+    return true;
+}
+
 FaceResult FaceDetector::detect(const uint8_t* frameData, int width, int height) {
-    (void)frameData;
-    (void)width;
-    (void)height;
-    return FaceResult{};
+    if (!enabled_ || frameData == nullptr || width <= 0 || height <= 0) {
+        return FaceResult{};
+    }
+
+    const uint16_t* pixels = reinterpret_cast<const uint16_t*>(frameData);
+    int step = 4;
+    int skinCount = 0;
+    long sumX = 0, sumY = 0;
+    int minX = width, maxX = 0, minY = height, maxY = 0;
+
+    for (int y = 0; y < height; y += step) {
+        for (int x = 0; x < width; x += step) {
+            uint16_t pixel = pixels[y * width + x];
+            // Swap bytes (camera outputs big-endian RGB565)
+            pixel = (pixel >> 8) | (pixel << 8);
+
+            if (isSkinPixelRGB565(pixel)) {
+                skinCount++;
+                sumX += x;
+                sumY += y;
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+
+    int totalSampled = (width / step) * (height / step);
+    float skinRatio = (float)skinCount / (float)totalSampled;
+
+    if (skinCount < 30 || skinRatio < 0.03f || skinRatio > 0.6f) {
+        return FaceResult{};
+    }
+
+    int blobW = maxX - minX;
+    int blobH = maxY - minY;
+    if (blobW < 20 || blobH < 20) {
+        return FaceResult{};
+    }
+
+    float aspect = (float)blobW / (float)blobH;
+    if (aspect < 0.4f || aspect > 2.5f) {
+        return FaceResult{};
+    }
+
+    FaceResult result;
+    result.detected = true;
+    result.centerX = (int)(sumX / skinCount);
+    result.centerY = (int)(sumY / skinCount);
+    result.width = blobW;
+    result.height = blobH;
+    result.confidence = skinRatio > 0.15f ? 0.8f : 0.5f;
+    return result;
 }

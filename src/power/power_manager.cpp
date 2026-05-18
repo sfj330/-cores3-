@@ -35,18 +35,9 @@ void PowerManager::update() {
 }
 
 float PowerManager::readVoltage() {
-    // -------------------------------------------------
-    // PLACEHOLDER: Read battery voltage
-    //
-    // CoreS3 battery voltage reading depends on PMU API:
-    //   - Some M5CoreS3 versions expose M5.Axp.getBatteryVoltage()
-    //   - Others use M5.Power.getBatteryVoltage()
-    //
-    // For now, return 0.0 (USB powered / unknown).
-    // Replace with actual PMU read when hardware is available.
-    // -------------------------------------------------
-
-    return 0.0f;
+    int mv = M5.Power.getBatteryVoltage();
+    if (mv < 100) return 0.0f;
+    return mv / 1000.0f;
 }
 
 float PowerManager::getVoltage() const {
