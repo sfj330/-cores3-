@@ -55,23 +55,7 @@ bool XiaoZhiClient::begin() {
              macClean.c_str() + 6);
     clientId_ = uuidBuf;
 
-    pcmCaptureBuf_ = (int16_t*)heap_caps_malloc(AUDIO_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    for (int i = 0; i < PLAYBACK_BUFFER_COUNT; ++i) {
-        pcmPlaybackBufs_[i] = (int16_t*)heap_caps_malloc(OPUS_MAX_DECODE_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    opusEncodeBuf_ = (uint8_t*)heap_caps_malloc(OPUS_MAX_PACKET_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    opusTxQueue_ = xQueueCreate(4, sizeof(OpusTxPacket));
-
-    bool playbackBuffersOk = true;
-    for (int i = 0; i < PLAYBACK_BUFFER_COUNT; ++i) {
-        playbackBuffersOk = playbackBuffersOk && pcmPlaybackBufs_[i] != nullptr;
-    }
-    if (!pcmCaptureBuf_ || !playbackBuffersOk || !opusEncodeBuf_ || !opusTxQueue_) {
-        Serial.println("XiaoZhi: audio buffer allocation failed");
-        lastError_ = "Audio alloc failed";
-    }
-
-    Serial.println("XiaoZhiClient OK");
+    Serial.println("XiaoZhiClient OK (audio buffers deferred)");
     return true;
 }
 
@@ -79,22 +63,67 @@ bool XiaoZhiClient::end() {
     closeAudioChannel();
     deinitAudio();
     deinitOpusCodec();
-    if (pcmCaptureBuf_) { heap_caps_free(pcmCaptureBuf_); pcmCaptureBuf_ = nullptr; }
+    releaseAudioBuffers();
+    activated_ = false;
+    connected_ = false;
+    initialized_ = false;
+    return true;
+}
+
+bool XiaoZhiClient::ensureAudioBuffers() {
+    bool playbackBuffersOk = true;
+    for (int i = 0; i < PLAYBACK_BUFFER_COUNT; ++i) {
+        playbackBuffersOk = playbackBuffersOk && pcmPlaybackBufs_[i] != nullptr;
+    }
+    if (pcmCaptureBuf_ && playbackBuffersOk && opusEncodeBuf_ && opusTxQueue_) {
+        return true;
+    }
+
+    releaseAudioBuffers();
+    pcmCaptureBuf_ = (int16_t*)heap_caps_malloc(AUDIO_FRAME_SAMPLES * sizeof(int16_t),
+                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    for (int i = 0; i < PLAYBACK_BUFFER_COUNT; ++i) {
+        pcmPlaybackBufs_[i] = (int16_t*)heap_caps_malloc(OPUS_MAX_DECODE_SAMPLES * sizeof(int16_t),
+                                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    opusEncodeBuf_ = (uint8_t*)heap_caps_malloc(OPUS_MAX_PACKET_BYTES,
+                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    opusTxQueue_ = xQueueCreate(4, sizeof(OpusTxPacket));
+
+    playbackBuffersOk = true;
+    for (int i = 0; i < PLAYBACK_BUFFER_COUNT; ++i) {
+        playbackBuffersOk = playbackBuffersOk && pcmPlaybackBufs_[i] != nullptr;
+    }
+    if (!pcmCaptureBuf_ || !playbackBuffersOk || !opusEncodeBuf_ || !opusTxQueue_) {
+        Serial.println("XiaoZhi: audio buffer allocation failed");
+        lastError_ = "Audio alloc failed";
+        releaseAudioBuffers();
+        return false;
+    }
+
+    Serial.printf("XiaoZhi: audio buffers ready heap=%u\n", ESP.getFreeHeap());
+    return true;
+}
+
+void XiaoZhiClient::releaseAudioBuffers() {
+    if (opusTxQueue_) {
+        vQueueDelete(opusTxQueue_);
+        opusTxQueue_ = nullptr;
+    }
+    if (pcmCaptureBuf_) {
+        heap_caps_free(pcmCaptureBuf_);
+        pcmCaptureBuf_ = nullptr;
+    }
     for (int i = 0; i < PLAYBACK_BUFFER_COUNT; ++i) {
         if (pcmPlaybackBufs_[i]) {
             heap_caps_free(pcmPlaybackBufs_[i]);
             pcmPlaybackBufs_[i] = nullptr;
         }
     }
-    if (opusEncodeBuf_) { heap_caps_free(opusEncodeBuf_); opusEncodeBuf_ = nullptr; }
-    if (opusTxQueue_) {
-        vQueueDelete(opusTxQueue_);
-        opusTxQueue_ = nullptr;
+    if (opusEncodeBuf_) {
+        heap_caps_free(opusEncodeBuf_);
+        opusEncodeBuf_ = nullptr;
     }
-    activated_ = false;
-    connected_ = false;
-    initialized_ = false;
-    return true;
 }
 
 String XiaoZhiClient::getMacAddress() {
@@ -436,6 +465,7 @@ void XiaoZhiClient::closeAudioChannel() {
     }
     deinitAudio();
     deinitOpusCodec();
+    releaseAudioBuffers();
     serverHelloReceived_ = false;
     listenStarted_ = false;
     mcpReady_ = false;
@@ -968,23 +998,39 @@ void XiaoZhiClient::parseServerHello(const char* data, size_t len) {
 
 bool XiaoZhiClient::initAudio() {
     if (audioInitialized_) return true;
+    if (!ensureAudioBuffers()) {
+        setState(VoiceState::ERROR);
+        return false;
+    }
     if (!initOpusCodec()) {
+        releaseAudioBuffers();
         setState(VoiceState::ERROR);
         return false;
     }
 
     stopSpeaker();
     if (!startMic()) {
+        deinitOpusCodec();
+        releaseAudioBuffers();
+        setState(VoiceState::ERROR);
+        return false;
+    }
+
+    BaseType_t taskOk = xTaskCreatePinnedToCore(
+        [](void* arg) { static_cast<XiaoZhiClient*>(arg)->audioCaptureTask(); },
+        "AudioCap", 32768, this, 4, &audioCaptureTaskHandle_, 0);
+    if (taskOk != pdPASS) {
+        Serial.println("XiaoZhi: audio capture task create failed");
+        lastError_ = "Audio task failed";
+        stopMic();
+        deinitOpusCodec();
+        releaseAudioBuffers();
         setState(VoiceState::ERROR);
         return false;
     }
 
     audioInitialized_ = true;
     Serial.println("XiaoZhi: audio I/O initialized (half-duplex mic)");
-
-    xTaskCreatePinnedToCore(
-        [](void* arg) { static_cast<XiaoZhiClient*>(arg)->audioCaptureTask(); },
-        "AudioCap", 32768, this, 4, &audioCaptureTaskHandle_, 0);
 
     return true;
 }

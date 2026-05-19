@@ -17,7 +17,6 @@
 #include "ui/pomodoro_ui.h"
 #include "ui/info_ui.h"
 #include "ui/music_ui.h"
-#include "ui/servo_test_ui.h"
 #include "ui/affinity_ui.h"
 #include "ui/settings_ui.h"
 #include "ui/ui_theme.h"
@@ -42,7 +41,6 @@ CameraDebugUI gCameraDebugUI;
 PomodoroUI gPomodoroUI;
 InfoUI gInfoUI;
 MusicUI gMusicUI;
-ServoTestUI gServoTestUI;
 AffinityUI gAffinityUI;
 SettingsUI gSettingsUI;
 CameraManager gCameraManager;
@@ -81,6 +79,8 @@ static bool gNtpSynced = false;
 static volatile bool gNeedActivationRequest = false;
 static volatile bool gNeedActivationCheck = false;
 static volatile bool gNeedOpenAudioChannel = false;
+static volatile bool gNeedCameraDeinitForAi = false;
+static volatile bool gNeedForegroundCameraStart = false;
 static bool gActivationCodeRequested = false;
 static unsigned long gLastActivationCheck = 0;
 static volatile bool gPomodoroCompletionPending = false;
@@ -178,16 +178,6 @@ static DeviceControlRequest gPendingDeviceControl;
 static AppStateEnum gPomodoroReturnTo = AppStateEnum::MENU;
 static AppStateEnum gMusicReturnTo = AppStateEnum::MENU;
 
-static bool gServoTestPageActive = false;
-static bool gServoTestReadyForUpdates = false;
-static unsigned long gServoTestInputEnableAt = 0;
-static bool gServoTestTrackingEnabled = true;
-static unsigned long gLastServoUpdate = 0;
-static unsigned long gLastServoSerialLog = 0;
-static float gServoFilteredPanInput = 0.0f;
-static float gServoFilteredTiltInput = 0.0f;
-static float gServoPanAngle = static_cast<float>(SERVO_PAN_CENTER_DEG);
-static float gServoTiltAngle = static_cast<float>(SERVO_TILT_CENTER_DEG);
 static FaceEmotion gLastServoPoseEmotion = FaceEmotion::NORMAL;
 
 static volatile bool gPhotoFaceTrackingActive = false;
@@ -223,12 +213,26 @@ enum class AiVisionStatus {
     ERROR
 };
 
+enum class FaceVisionRuntime {
+    IDLE,
+    BURST,
+    COOLDOWN
+};
+
 static AiVisionStatus gAiVisionStatus = AiVisionStatus::IDLE;
 static String gAiVisionStatusText = "Vision idle";
 static String gAiVisionResultText = "";
 static SystemStatusViewModel gSystemStatus;
-static SystemBrightnessLevel gUserBrightnessLevel = SystemBrightnessLevel::BRIGHT;
+static SystemBrightnessLevel gUserBrightnessLevel = SystemBrightnessLevel::NORMAL;
 static SystemVolumeLevel gUserVolumeLevel = SystemVolumeLevel::NORMAL;
+static FaceVisionRuntime gFaceVisionRuntime = FaceVisionRuntime::IDLE;
+static unsigned long gFaceVisionBurstUntil = 0;
+static unsigned long gFaceVisionNextIdleScanAt = 0;
+static bool gFaceVisionStartPending = false;
+static const char* gFaceVisionPendingReason = nullptr;
+static const char* gForegroundCameraReason = nullptr;
+static unsigned long gBrownoutSafeUntil = 0;
+static esp_reset_reason_t gBootResetReason = ESP_RST_UNKNOWN;
 
 struct PomodoroMelodyNote {
     float frequency;
@@ -277,8 +281,6 @@ static String buildDeviceStatusResponse(const String& detail);
 static String processDeviceStatus(int callId, const String& detail);
 static String processDeviceControl(int callId);
 static bool hasPendingDeviceControlAction();
-static void resetServoTestControl();
-static void updateServoTestFromImu(unsigned long now);
 static void updateSharedServoMotion(unsigned long now);
 static void updateCompanionMotion(unsigned long now);
 static void updateDanceLifecycle(unsigned long now);
@@ -287,6 +289,16 @@ static bool startDanceMusic(String& note);
 static void applyServoPoseForEmotion(FaceEmotion emotion);
 static void applyServoPoseForPetReaction(PetReaction reaction);
 static bool prepareFaceTrackingForPhoto(String& note);
+static bool ensureCameraTaskStarted();
+static void requestForegroundCameraStart(const char* reason);
+static bool openForegroundCameraNow(const char* reason);
+static void processForegroundCameraStart();
+static bool isBrownoutSafeModeActive(unsigned long now);
+static bool isFaceVisionBurstActive();
+static void requestFaceVisionBurst(unsigned long now, unsigned long durationMs, const char* reason);
+static bool startFaceVisionCapture(unsigned long now);
+static void stopFaceVisionBurst(const char* reason);
+static void updateFaceVisionRuntime(unsigned long now);
 static ServoMotionAction toServoMotionAction(ServoAiAction action);
 static const char* servoAiActionName(ServoAiAction action);
 
@@ -581,99 +593,6 @@ static bool startDanceMusic(String& note) {
     return false;
 }
 
-static float clampFloat(float value, float minValue, float maxValue) {
-    if (value < minValue) return minValue;
-    if (value > maxValue) return maxValue;
-    return value;
-}
-
-static float applyServoDeadband(float valueDeg) {
-    return fabsf(valueDeg) < SERVO_TEST_DEADBAND_DEG ? 0.0f : valueDeg;
-}
-
-static float rateLimitAngle(float current, float target, float maxDelta) {
-    float delta = target - current;
-    if (delta > maxDelta) return current + maxDelta;
-    if (delta < -maxDelta) return current - maxDelta;
-    return target;
-}
-
-static void resetServoTestControl() {
-    gServoFilteredPanInput = 0.0f;
-    gServoFilteredTiltInput = 0.0f;
-    gServoPanAngle = static_cast<float>(SERVO_TEST_PAN_CENTER_DEG);
-    gServoTiltAngle = static_cast<float>(SERVO_TEST_TILT_CENTER_DEG);
-    gLastServoUpdate = 0;
-    gLastServoSerialLog = 0;
-}
-
-static void updateServoTestFromImu(unsigned long now) {
-    if (!gServoTestReadyForUpdates) return;
-    if (now < gServoTestInputEnableAt) return;
-    if (gLastServoUpdate != 0 && now - gLastServoUpdate < SERVO_TEST_UPDATE_MS) return;
-
-    float dtSec = SERVO_TEST_UPDATE_MS / 1000.0f;
-    if (gLastServoUpdate != 0) {
-        dtSec = (now - gLastServoUpdate) / 1000.0f;
-        if (dtSec <= 0.0f) {
-            dtSec = SERVO_TEST_UPDATE_MS / 1000.0f;
-        }
-    }
-    gLastServoUpdate = now;
-
-    M5.Imu.update();
-    float ax = 0.0f;
-    float ay = 0.0f;
-    float az = 0.0f;
-    M5.Imu.getAccel(&ax, &ay, &az);
-
-    float rawPan = atan2f(ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
-    float rawTilt = atan2f(ay, sqrtf(ax * ax + az * az)) * 180.0f / PI;
-    if (SERVO_PAN_INVERT) rawPan = -rawPan;
-    if (SERVO_TILT_INVERT) rawTilt = -rawTilt;
-
-    rawPan = applyServoDeadband(rawPan);
-    rawTilt = applyServoDeadband(rawTilt);
-
-    gServoFilteredPanInput += (rawPan - gServoFilteredPanInput) * SERVO_TEST_FILTER_ALPHA;
-    gServoFilteredTiltInput += (rawTilt - gServoFilteredTiltInput) * SERVO_TEST_FILTER_ALPHA;
-
-    float targetPan = static_cast<float>(SERVO_TEST_PAN_CENTER_DEG) + gServoFilteredPanInput;
-    float targetTilt = static_cast<float>(SERVO_TEST_TILT_CENTER_DEG) + gServoFilteredTiltInput;
-    targetPan = clampFloat(targetPan, SERVO_SAFE_MIN_DEG, SERVO_SAFE_MAX_DEG);
-    targetTilt = clampFloat(targetTilt, SERVO_SAFE_MIN_DEG, SERVO_SAFE_MAX_DEG);
-
-    float maxDelta = SERVO_TEST_MAX_SPEED_DPS * dtSec;
-    gServoPanAngle = rateLimitAngle(gServoPanAngle, targetPan, maxDelta);
-    gServoTiltAngle = rateLimitAngle(gServoTiltAngle, targetTilt, maxDelta);
-
-    if (gServoTestTrackingEnabled && gServoController.isReady()) {
-        gServoController.setPanTilt(gServoPanAngle, gServoTiltAngle);
-    }
-
-    gServoTestUI.setTelemetry(gServoController.isReady(),
-                              gServoController.statusText(),
-                              ax, ay, az,
-                              gServoFilteredPanInput / SERVO_TEST_SWEEP_DEG,
-                              gServoFilteredTiltInput / SERVO_TEST_SWEEP_DEG,
-                              gServoPanAngle,
-                              gServoTiltAngle,
-                              gServoController.isReleased());
-
-    if (now - gLastServoSerialLog >= 500) {
-        gLastServoSerialLog = now;
-        Serial.printf("Servo Test: ax=%.2f ay=%.2f az=%.2f xTilt=%.1f yTilt=%.1f pan=%.1f ch=%d tilt=%.1f ch=%d ready=%d\n",
-                      ax, ay, az,
-                      gServoFilteredPanInput,
-                      gServoFilteredTiltInput,
-                      gServoPanAngle,
-                      SERVO_PAN_CHANNEL,
-                      gServoTiltAngle,
-                      SERVO_TILT_CHANNEL,
-                      gServoController.isReady() ? 1 : 0);
-    }
-}
-
 static ServoMotionAction toServoMotionAction(ServoAiAction action) {
     switch (action) {
         case ServoAiAction::CENTER: return ServoMotionAction::CENTER;
@@ -735,8 +654,6 @@ static void applyServoPoseForPetReaction(PetReaction reaction) {
 }
 
 static void applyServoPoseForEmotion(FaceEmotion emotion) {
-    if (AppState::instance().getState() == AppStateEnum::SERVO_TEST) return;
-
     switch (emotion) {
         case FaceEmotion::NORMAL:
             gServoMotionController.center(SERVO_FACE_MOTION_SPEED_DPS);
@@ -782,15 +699,6 @@ static void applyServoPoseForEmotion(FaceEmotion emotion) {
 
 static void updateSharedServoMotion(unsigned long now) {
     AppStateEnum state = AppState::instance().getState();
-    if (state == AppStateEnum::SERVO_TEST) {
-        if (gServoTestPageActive && now < gServoTestInputEnableAt) {
-            gServoMotionController.update(now);
-        } else {
-            gServoMotionController.suspend();
-        }
-        return;
-    }
-
     if (gFaceTrackCorrectionPending &&
         (state == AppStateEnum::FACE || state == AppStateEnum::CAMERA_DEBUG || state == AppStateEnum::AI_VISION)) {
         float panDelta = gFaceTrackPanDeltaDeg;
@@ -845,12 +753,13 @@ static void updateDanceLifecycle(unsigned long now) {
 
 static void updateCompanionMotion(unsigned long now) {
     AppStateEnum state = AppState::instance().getState();
-    if (state == AppStateEnum::SERVO_TEST ||
-        state == AppStateEnum::CAMERA_DEBUG ||
+    if (state == AppStateEnum::CAMERA_DEBUG ||
         state == AppStateEnum::AI_VISION ||
         state == AppStateEnum::POMODORO ||
         state == AppStateEnum::MUSIC ||
         state == AppStateEnum::AFFINITY ||
+        isFaceVisionBurstActive() ||
+        isBrownoutSafeModeActive(now) ||
         gServoMotionController.isDanceActive() ||
         gPetReactActive ||
         gSickActive) {
@@ -1112,10 +1021,6 @@ void uiTask(void* pvParameters) {
                 case AppStateEnum::MUSIC:
                     updateMusicUiData();
                     gMusicUI.update();
-                    break;
-
-                case AppStateEnum::SERVO_TEST:
-                    gServoTestUI.update();
                     break;
 
                 case AppStateEnum::AFFINITY:
@@ -2140,14 +2045,6 @@ static void processServoControl(int callId) {
         action = ServoAiAction::CENTER;
     }
 
-    if (AppState::instance().getState() == AppStateEnum::SERVO_TEST) {
-        if (callId >= 0) {
-            gXiaoZhiClient.queueMcpToolTextResult(callId,
-                "Servo Test owns the servos. Leave Servo Test before voice servo control.", true);
-        }
-        return;
-    }
-
     ServoMotionAction motionAction = toServoMotionAction(action);
     bool ok = false;
     if (motionAction == ServoMotionAction::RELEASE) {
@@ -2246,14 +2143,7 @@ static bool ensureAiVisionPreview(const char* status) {
     }
 
     setAiVisionStatus(AiVisionStatus::OPENING, status ? status : "Opening camera", nullptr);
-    bool cameraReady = gCameraManager.isInitialized() || gCameraManager.begin();
-    cameraReady = cameraReady && gCameraManager.startCapture();
-    gCameraDebugUI.setCameraReady(cameraReady);
-    setAiVisionStatus(cameraReady ? AiVisionStatus::PREVIEW : AiVisionStatus::ERROR,
-                      cameraReady ? "Camera on" : "Camera failed",
-                      cameraReady ? gAiVisionResultText.c_str() : "Camera unavailable");
-    Serial.println(cameraReady ? "AI Vision: camera on" : "AI Vision: camera failed");
-    return cameraReady;
+    return openForegroundCameraNow("AI Vision tool");
 }
 
 static void closeAiVisionPreview() {
@@ -2457,24 +2347,30 @@ static void gestureEventHandler(const GestureEvent& event) {
         case AppStateEnum::FACE:
             switch (event.type) {
                 case GestureType::RIGHT_SWIPE:
+                    requestFaceVisionBurst(millis(), FACE_VISION_TOUCH_BURST_MS, "face right swipe");
                     appState.setState(AppStateEnum::MENU);
                     break;
                 case GestureType::LEFT_SWIPE:
+                    requestFaceVisionBurst(millis(), FACE_VISION_TOUCH_BURST_MS, "face left swipe");
                     appState.setState(AppStateEnum::AI);
                     break;
                 case GestureType::DOWN_SWIPE:
+                    requestFaceVisionBurst(millis(), FACE_VISION_TOUCH_BURST_MS, "face down swipe");
                     updateAffinityUiData();
                     appState.setState(AppStateEnum::AFFINITY);
                     break;
                 case GestureType::UP_SWIPE:
+                    requestFaceVisionBurst(millis(), FACE_VISION_TOUCH_BURST_MS, "face up swipe");
                     gSettingsUI.setBrightness(static_cast<int>(gUserBrightnessLevel));
                     gSettingsUI.setVolume(static_cast<int>(gUserVolumeLevel));
                     appState.setState(AppStateEnum::SETTINGS);
                     break;
                 case GestureType::SINGLE_TAP:
+                    requestFaceVisionBurst(millis(), FACE_VISION_TOUCH_BURST_MS, "face tap");
                     handleFaceTap(event.endX, event.endY);
                     break;
                 case GestureType::DOUBLE_TAP:
+                    requestFaceVisionBurst(millis(), FACE_VISION_TOUCH_BURST_MS, "face double tap");
                     appState.setState(AppStateEnum::AI);
                     break;
                 case GestureType::LONG_PRESS:
@@ -2529,7 +2425,6 @@ static void gestureEventHandler(const GestureEvent& event) {
                         case 2: gPomodoroReturnTo = AppStateEnum::MENU; appState.setState(AppStateEnum::POMODORO); break;
                         case 3: gMusicReturnTo = AppStateEnum::MENU; appState.setState(AppStateEnum::MUSIC); break;
                         case 4: appState.setState(AppStateEnum::SYSTEM_INFO); break;
-                        case 5: appState.setState(AppStateEnum::SERVO_TEST); break;
                     }
                     break;
                 }
@@ -2666,47 +2561,6 @@ static void gestureEventHandler(const GestureEvent& event) {
             break;
         }
 
-        case AppStateEnum::SERVO_TEST: {
-            ServoHitZone hit = gServoTestUI.hitTest(event.endX, event.endY);
-            if (event.type == GestureType::SINGLE_TAP) {
-                if (hit == ServoHitZone::SERVO_HIT_BACK) {
-                    appState.setState(AppStateEnum::MENU);
-                    break;
-                }
-                resetServoTestControl();
-                gServoTestTrackingEnabled = true;
-                gServoMotionController.ensureReady();
-                gServoMotionController.lookOffset(
-                    static_cast<float>(SERVO_TEST_PAN_CENTER_DEG - SERVO_PAN_CENTER_DEG),
-                    static_cast<float>(SERVO_TEST_TILT_CENTER_DEG - SERVO_TILT_CENTER_DEG),
-                    SERVO_TEST_TRANSITION_SPEED_DPS,
-                    "Servo test center");
-                gServoTestUI.markDirty();
-                Serial.println("Servo Test: center");
-                break;
-            }
-            switch (event.type) {
-                case GestureType::LEFT_SWIPE:
-                    appState.setState(AppStateEnum::MENU);
-                    break;
-                case GestureType::LONG_PRESS:
-                    gServoTestTrackingEnabled = false;
-                    gServoController.release();
-                    gServoTestUI.setTelemetry(gServoController.isReady(),
-                                              gServoController.statusText(),
-                                              0.0f, 0.0f, 0.0f,
-                                              gServoFilteredPanInput,
-                                              gServoFilteredTiltInput,
-                                              gServoPanAngle,
-                                              gServoTiltAngle,
-                                              gServoController.isReleased());
-                    break;
-                default:
-                    break;
-            }
-            break;
-        }
-
         case AppStateEnum::AFFINITY: {
             AffinityHitZone hit = gAffinityUI.hitTest(event.endX, event.endY);
             if (event.type == GestureType::SINGLE_TAP &&
@@ -2790,13 +2644,9 @@ static void gestureEventHandler(const GestureEvent& event) {
 }
 
 static void stateChangeHandler(AppStateEnum state) {
-    if (state != AppStateEnum::SERVO_TEST) {
-        gServoTestReadyForUpdates = false;
-        if (gServoTestPageActive) {
-            gServoMotionController.center(SERVO_SAFE_CENTER_SPEED_DPS);
-            gServoTestPageActive = false;
-        }
-        gServoTestUI.hide();
+    if (state != AppStateEnum::CAMERA_DEBUG && state != AppStateEnum::AI_VISION) {
+        gNeedForegroundCameraStart = false;
+        gForegroundCameraReason = nullptr;
     }
     if (state != AppStateEnum::CAMERA_DEBUG && state != AppStateEnum::AI_VISION) {
         gPhotoFaceTrackingActive = false;
@@ -2848,14 +2698,7 @@ static void stateChangeHandler(AppStateEnum state) {
             gSickActive = false;
             gSickUntil = 0;
             gActivationCodeRequested = false;
-            if (gFaceDetector.backendAvailable()) {
-                gFaceDetector.setEnabled(true);
-                if (!gCameraManager.isRunning()) {
-                    bool camOk = gCameraManager.isInitialized() || gCameraManager.begin();
-                    camOk = camOk && gCameraManager.startCapture();
-                    Serial.println(camOk ? "Vision: camera started" : "Vision: camera start failed");
-                }
-            }
+            requestFaceVisionBurst(millis(), FACE_VISION_TOUCH_BURST_MS, "enter face");
             gLastServoPoseEmotion = AppState::instance().getEmotion();
             applyServoPoseForEmotion(gLastServoPoseEmotion);
             break;
@@ -2868,10 +2711,7 @@ static void stateChangeHandler(AppStateEnum state) {
             gMusicUI.hide();
             stopMusicForExclusiveAudio();
             gFaceDetector.setEnabled(false);
-            if (gCameraManager.isInitialized()) {
-                gCameraManager.end();
-                Serial.println("AI: camera deinit for mic");
-            }
+            gCameraManager.stopCapture();
             gFaceUI.clearStatusText();
             gPetReactActive = false;
             gAiListeningAffinityAwarded = false;
@@ -2907,15 +2747,19 @@ static void stateChangeHandler(AppStateEnum state) {
             if (gFaceDetector.backendAvailable()) {
                 gFaceDetector.setEnabled(true);
             }
-            bool cameraReady = gCameraManager.isInitialized() || gCameraManager.begin();
-            cameraReady = cameraReady && gCameraManager.startCapture();
+            bool cameraReady = gCameraManager.isRunning();
             gCameraDebugUI.setCameraReady(cameraReady);
-            if (!cameraReady) {
-                setAiVisionStatus(AiVisionStatus::ERROR, "Camera failed", "Camera unavailable");
+            if (cameraReady) {
+                if (gAiVisionStatus == AiVisionStatus::IDLE) {
+                    setAiVisionStatus(AiVisionStatus::PREVIEW, "Camera on", "");
+                }
             } else if (gAiVisionStatus == AiVisionStatus::IDLE) {
-                setAiVisionStatus(AiVisionStatus::PREVIEW, "Camera on", "");
+                setAiVisionStatus(AiVisionStatus::OPENING, "Opening camera", "");
             }
-            Serial.println(cameraReady ? "AI Vision preview started" : "AI Vision camera start failed");
+            if (!cameraReady) {
+                requestForegroundCameraStart("AI Vision page");
+            }
+            Serial.println(cameraReady ? "AI Vision preview already running" : "AI Vision camera opening deferred");
             break;
         }
 
@@ -2960,12 +2804,14 @@ static void stateChangeHandler(AppStateEnum state) {
             }
             {
                 bool cameraReady = gCameraManager.isRunning();
-                if (!cameraReady) {
-                    cameraReady = gCameraManager.isInitialized() || gCameraManager.begin();
-                    cameraReady = cameraReady && gCameraManager.startCapture();
-                }
                 gCameraDebugUI.setCameraReady(cameraReady);
-                Serial.println(cameraReady ? "Camera debug started" : "Camera debug start failed");
+                if (cameraReady) {
+                    gCameraDebugUI.setCaptureStatus(gStorageManager.statusText().c_str());
+                } else {
+                    gCameraDebugUI.setCaptureStatus("Opening camera...");
+                    requestForegroundCameraStart("Camera debug page");
+                }
+                Serial.println(cameraReady ? "Camera debug already running" : "Camera debug opening deferred");
             }
             break;
 
@@ -2993,43 +2839,6 @@ static void stateChangeHandler(AppStateEnum state) {
             updateMusicUiData();
             gMusicUI.show();
             break;
-
-        case AppStateEnum::SERVO_TEST: {
-            gMenuUI.hide();
-            gCameraDebugUI.hide();
-            gPomodoroUI.hide();
-            gInfoUI.hide();
-            gMusicUI.hide();
-            gServoTestPageActive = true;
-            gServoTestReadyForUpdates = false;
-            gServoTestTrackingEnabled = true;
-            resetServoTestControl();
-            bool servoReady = gServoController.isReady();
-            if (!servoReady) {
-                servoReady = gServoController.begin();
-            }
-            if (servoReady) {
-                gServoMotionController.ensureReady();
-                gServoMotionController.lookOffset(
-                    static_cast<float>(SERVO_TEST_PAN_CENTER_DEG - SERVO_PAN_CENTER_DEG),
-                    static_cast<float>(SERVO_TEST_TILT_CENTER_DEG - SERVO_TILT_CENTER_DEG),
-                    SERVO_SAFE_CENTER_SPEED_DPS,
-                    "Servo test transition");
-            }
-            gServoTestInputEnableAt = millis() + SERVO_TEST_INPUT_ENABLE_DELAY_MS;
-            gServoTestUI.show();
-            gServoTestUI.setTelemetry(servoReady,
-                                      gServoController.statusText(),
-                                      0.0f, 0.0f, 0.0f,
-                                      gServoFilteredPanInput,
-                                      gServoFilteredTiltInput,
-                                      gServoPanAngle,
-                                      gServoTiltAngle,
-                                      gServoController.isReleased());
-            gServoTestReadyForUpdates = true;
-            Serial.println(servoReady ? "Servo Test: started" : "Servo Test: PCA9685 unavailable");
-            break;
-        }
 
         case AppStateEnum::AFFINITY:
             gMenuUI.hide();
@@ -3095,6 +2904,7 @@ static void aiStateHandler(VoiceState voiceState) {
 
 static void lowBatteryHandler(float voltage) {
     AppState& appState = AppState::instance();
+    stopFaceVisionBurst("low battery");
     if (appState.getState() == AppStateEnum::FACE) {
         appState.setEmotion(FaceEmotion::SLEEPY);
     }
@@ -3190,6 +3000,9 @@ static const char* resetReasonName(esp_reset_reason_t reason) {
 static bool createTaskChecked(TaskFunction_t taskFn, const char* name,
                               uint32_t stackSize, UBaseType_t priority,
                               TaskHandle_t* handle, BaseType_t core) {
+    if (handle != nullptr && *handle != nullptr) {
+        return true;
+    }
     BaseType_t result = xTaskCreatePinnedToCore(taskFn, name, stackSize, nullptr,
                                                 priority, handle, core);
     if (result != pdPASS) {
@@ -3200,6 +3013,223 @@ static bool createTaskChecked(TaskFunction_t taskFn, const char* name,
     }
     Serial.printf("Task created: %s\n", name);
     return true;
+}
+
+static bool ensureCameraTaskStarted() {
+    return createTaskChecked(cameraTask, "Camera", CAMERA_TASK_STACK_SIZE,
+                             CAMERA_TASK_PRIORITY, &cameraTaskHandle, 0);
+}
+
+static void requestForegroundCameraStart(const char* reason) {
+    gForegroundCameraReason = reason;
+    gNeedForegroundCameraStart = true;
+}
+
+static bool openForegroundCameraNow(const char* reason) {
+    AppStateEnum state = AppState::instance().getState();
+    if (state != AppStateEnum::CAMERA_DEBUG && state != AppStateEnum::AI_VISION) {
+        return false;
+    }
+    gNeedForegroundCameraStart = false;
+    gForegroundCameraReason = nullptr;
+
+    gFaceVisionRuntime = FaceVisionRuntime::COOLDOWN;
+    gFaceVisionBurstUntil = 0;
+    gFaceVisionStartPending = false;
+    gFaceVisionPendingReason = nullptr;
+    if (gFaceDetector.backendAvailable()) {
+        gFaceDetector.setEnabled(true);
+    }
+
+    // A user-opened Camera/AI Vision page should not be blocked by a previous
+    // background detection failure cooldown.
+    gCameraManager.resetFailure();
+    bool cameraReady = ensureCameraTaskStarted();
+    cameraReady = cameraReady && (gCameraManager.isInitialized() || gCameraManager.begin());
+    cameraReady = cameraReady && gCameraManager.startCapture();
+
+    if (!cameraReady) {
+        Serial.printf("Foreground camera start failed: %s; retrying reinit\n",
+                      reason ? reason : "camera");
+        gCameraManager.end();
+        vTaskDelay(pdMS_TO_TICKS(80));
+        gCameraManager.resetFailure();
+        cameraReady = ensureCameraTaskStarted();
+        cameraReady = cameraReady && gCameraManager.begin();
+        cameraReady = cameraReady && gCameraManager.startCapture();
+    }
+
+    gCameraDebugUI.setCameraReady(cameraReady);
+    if (state == AppStateEnum::CAMERA_DEBUG) {
+        gCameraDebugUI.setCaptureStatus(cameraReady ? gStorageManager.statusText().c_str()
+                                                    : "Camera start failed");
+    } else {
+        setAiVisionStatus(cameraReady ? AiVisionStatus::PREVIEW : AiVisionStatus::ERROR,
+                          cameraReady ? "Camera on" : "Camera failed",
+                          cameraReady ? gAiVisionResultText.c_str() : "Camera unavailable");
+    }
+
+    Serial.printf("Foreground camera %s: %s\n",
+                  cameraReady ? "ready" : "failed",
+                  reason ? reason : "camera");
+    return cameraReady;
+}
+
+static void processForegroundCameraStart() {
+    if (!gNeedForegroundCameraStart) {
+        return;
+    }
+
+    AppStateEnum state = AppState::instance().getState();
+    if (state != AppStateEnum::CAMERA_DEBUG && state != AppStateEnum::AI_VISION) {
+        gNeedForegroundCameraStart = false;
+        gForegroundCameraReason = nullptr;
+        return;
+    }
+
+    const char* reason = gForegroundCameraReason;
+    gNeedForegroundCameraStart = false;
+    gForegroundCameraReason = nullptr;
+    openForegroundCameraNow(reason);
+}
+
+static bool isBrownoutSafeModeActive(unsigned long now) {
+    return gBrownoutSafeUntil != 0 &&
+           static_cast<long>(now - gBrownoutSafeUntil) < 0;
+}
+
+static bool isFaceVisionBurstActive() {
+    return gFaceVisionRuntime == FaceVisionRuntime::BURST;
+}
+
+static void requestFaceVisionBurst(unsigned long now, unsigned long durationMs, const char* reason) {
+    if (!FACE_DETECTION_ENABLED_ON_BOOT || !gFaceDetector.backendAvailable()) {
+        return;
+    }
+    if (AppState::instance().getState() != AppStateEnum::FACE) {
+        return;
+    }
+    if (isBrownoutSafeModeActive(now) || gPowerManager.isLowBattery()) {
+        gFaceVisionRuntime = FaceVisionRuntime::COOLDOWN;
+        gFaceVisionNextIdleScanAt = now + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+        gFaceVisionStartPending = false;
+        gFaceDetector.setEnabled(false);
+        gCameraManager.stopCapture();
+        Serial.printf("Face vision skipped: %s (%s)\n",
+                      isBrownoutSafeModeActive(now) ? "brownout safe mode" : "low battery",
+                      reason ? reason : "");
+        return;
+    }
+
+    unsigned long newDeadline = now + durationMs;
+    if (gFaceVisionRuntime == FaceVisionRuntime::BURST &&
+        static_cast<long>(newDeadline - gFaceVisionBurstUntil) < 0) {
+        newDeadline = gFaceVisionBurstUntil;
+    }
+    gFaceVisionRuntime = FaceVisionRuntime::BURST;
+    gFaceVisionBurstUntil = newDeadline;
+    gFaceVisionNextIdleScanAt = newDeadline + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+    gFaceVisionStartPending = true;
+    gFaceVisionPendingReason = reason;
+    Serial.printf("Face vision queued: %s, %lums\n",
+                  reason ? reason : "burst",
+                  static_cast<unsigned long>(durationMs));
+}
+
+static bool startFaceVisionCapture(unsigned long now) {
+    (void)now;
+    bool cameraOk = ensureCameraTaskStarted();
+    cameraOk = cameraOk && (gCameraManager.isInitialized() || gCameraManager.begin());
+    cameraOk = cameraOk && gCameraManager.startCapture();
+    if (!cameraOk) {
+        gFaceDetector.setEnabled(false);
+        gCameraManager.stopCapture();
+        gFaceVisionRuntime = FaceVisionRuntime::COOLDOWN;
+        gFaceVisionBurstUntil = 0;
+        gFaceVisionStartPending = false;
+        gFaceVisionNextIdleScanAt = millis() + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+        Serial.printf("Face vision start failed: %s\n",
+                      gFaceVisionPendingReason ? gFaceVisionPendingReason : "burst");
+        return false;
+    }
+
+    gFaceDetector.setEnabled(true);
+    gFaceVisionStartPending = false;
+    Serial.printf("Face vision started: %s\n",
+                  gFaceVisionPendingReason ? gFaceVisionPendingReason : "burst");
+    return true;
+}
+
+static void stopFaceVisionBurst(const char* reason) {
+    if (gFaceVisionRuntime != FaceVisionRuntime::BURST &&
+        !gFaceDetector.isEnabled() &&
+        !gCameraManager.isRunning()) {
+        return;
+    }
+
+    gFaceDetector.setEnabled(false);
+    if (AppState::instance().getState() == AppStateEnum::FACE) {
+        gCameraManager.stopCapture();
+        if (AppState::instance().getEmotion() == FaceEmotion::TRACKING) {
+            AppState::instance().setEmotion(FaceEmotion::NORMAL);
+        }
+        gFaceUI.setGazeOffset(0, 0);
+        gFaceTracker.update(FaceResult{});
+    }
+    gFaceVisionRuntime = FaceVisionRuntime::COOLDOWN;
+    gFaceVisionBurstUntil = 0;
+    gFaceVisionStartPending = false;
+    gFaceVisionPendingReason = nullptr;
+    gFaceVisionNextIdleScanAt = millis() + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+    Serial.printf("Face vision stopped: %s\n", reason ? reason : "idle");
+}
+
+static void updateFaceVisionRuntime(unsigned long now) {
+    AppStateEnum state = AppState::instance().getState();
+    if (state != AppStateEnum::FACE) {
+        if (gFaceVisionRuntime == FaceVisionRuntime::BURST) {
+            gFaceVisionRuntime = FaceVisionRuntime::COOLDOWN;
+            gFaceVisionBurstUntil = 0;
+            gFaceVisionStartPending = false;
+            gFaceVisionNextIdleScanAt = now + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+            Serial.println("Face vision paused: left face");
+        }
+        return;
+    }
+
+    if (isBrownoutSafeModeActive(now) || gPowerManager.isLowBattery()) {
+        if (gFaceVisionRuntime == FaceVisionRuntime::BURST ||
+            gFaceDetector.isEnabled() ||
+            gCameraManager.isRunning()) {
+            stopFaceVisionBurst(isBrownoutSafeModeActive(now) ? "brownout safe mode" : "low battery");
+        }
+        gFaceVisionRuntime = FaceVisionRuntime::COOLDOWN;
+        gFaceVisionNextIdleScanAt = now + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+        return;
+    }
+
+    if (gFaceVisionRuntime == FaceVisionRuntime::BURST) {
+        if (static_cast<long>(now - gFaceVisionBurstUntil) >= 0) {
+            stopFaceVisionBurst("burst complete");
+            return;
+        }
+        if (gFaceVisionStartPending ||
+            !gCameraManager.isRunning() ||
+            !gFaceDetector.isEnabled()) {
+            startFaceVisionCapture(now);
+        }
+        return;
+    }
+
+    if (gFaceVisionNextIdleScanAt == 0) {
+        gFaceVisionNextIdleScanAt = now + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+        gFaceVisionRuntime = FaceVisionRuntime::IDLE;
+        return;
+    }
+
+    if (static_cast<long>(now - gFaceVisionNextIdleScanAt) >= 0) {
+        requestFaceVisionBurst(now, FACE_VISION_IDLE_RESCAN_BURST_MS, "idle rescan");
+    }
 }
 
 void setup() {
@@ -3214,14 +3244,20 @@ void setup() {
     cfg.output_power = true;
     M5.begin(cfg);
     displayMutex = xSemaphoreCreateMutex();
-    applyBrightnessLevel(SystemBrightnessLevel::BRIGHT, true);
+    applyBrightnessLevel(SystemBrightnessLevel::NORMAL, true);
     drawLcdDarkBackground();
     M5.Lcd.setTextColor(UiTheme::TEXT, UiTheme::BG);
     M5.Lcd.setTextSize(1);
     M5.Lcd.setTextDatum(TL_DATUM);
     M5.Lcd.setCursor(12, 8);
     M5.Lcd.println("CoreS3 AI Pet // Boot");
-    esp_reset_reason_t resetReason = esp_reset_reason();
+    gBootResetReason = esp_reset_reason();
+    esp_reset_reason_t resetReason = gBootResetReason;
+    if (resetReason == ESP_RST_BROWNOUT) {
+        gBrownoutSafeUntil = millis() + BROWNOUT_SAFE_MODE_MS;
+        Serial.printf("Brownout safe mode active for %lums\n",
+                      static_cast<unsigned long>(BROWNOUT_SAFE_MODE_MS));
+    }
     M5.Lcd.setCursor(12, 24);
     M5.Lcd.printf("Reset: %s\n", resetReasonName(resetReason));
     Serial.printf("Reset reason: %s (%d)\n", resetReasonName(resetReason), static_cast<int>(resetReason));
@@ -3248,7 +3284,6 @@ void setup() {
     bootStep("PomodoroUI...", 5);
     gPomodoroUI.begin();
     gMusicUI.begin();
-    gServoTestUI.begin();
     gAffinityUI.begin();
     gSettingsUI.begin();
     gServoMotionController.attach(gServoController);
@@ -3340,28 +3375,41 @@ void setup() {
             }
             bootCanvas.deleteSprite();
         }
-        M5.Speaker.tone(800, 80);
-        delay(100);
-        M5.Speaker.tone(1200, 80);
-        delay(100);
-        M5.Speaker.tone(1600, 100);
-        delay(150);
+        if (BOOT_CHIME_ENABLED && resetReason != ESP_RST_BROWNOUT) {
+            M5.Speaker.tone(800, 80);
+            delay(100);
+            M5.Speaker.tone(1200, 80);
+            delay(100);
+            M5.Speaker.tone(1600, 100);
+            delay(150);
+        }
     }
 
     createTaskChecked(uiTask, "UI", UI_TASK_STACK_SIZE, UI_TASK_PRIORITY, &uiTaskHandle, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     createTaskChecked(touchTask, "Touch", TOUCH_TASK_STACK_SIZE, TOUCH_TASK_PRIORITY, &touchTaskHandle, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
-    createTaskChecked(cameraTask, "Camera", CAMERA_TASK_STACK_SIZE, CAMERA_TASK_PRIORITY, &cameraTaskHandle, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    createTaskChecked(visionTask, "Vision", VISION_TASK_STACK_SIZE, VISION_TASK_PRIORITY, &visionTaskHandle, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    if (gFaceDetector.backendAvailable()) {
+        createTaskChecked(visionTask, "Vision", VISION_TASK_STACK_SIZE, VISION_TASK_PRIORITY, &visionTaskHandle, 0);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    } else {
+        Serial.println("Camera/Vision tasks deferred: local face backend unavailable");
+    }
     createTaskChecked(aiTask, "AI", AI_TASK_STACK_SIZE, AI_TASK_PRIORITY, &aiTaskHandle, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     createTaskChecked(powerTask, "Power", POWER_TASK_STACK_SIZE, POWER_TASK_PRIORITY, &powerTaskHandle, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     createTaskChecked(networkTask, "Network", NETWORK_TASK_STACK_SIZE, NETWORK_TASK_PRIORITY, &networkTaskHandle, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
+    if (gFaceDetector.backendAvailable() && FACE_DETECTION_ENABLED_ON_BOOT) {
+        if (resetReason == ESP_RST_BROWNOUT) {
+            gFaceVisionRuntime = FaceVisionRuntime::COOLDOWN;
+            gFaceVisionNextIdleScanAt = millis() + FACE_VISION_IDLE_RESCAN_INTERVAL_MS;
+            Serial.println("Face vision boot burst skipped: brownout safe mode");
+        } else {
+            requestFaceVisionBurst(millis(), FACE_VISION_BOOT_BURST_MS, "boot");
+        }
+    }
     Serial.println("Setup complete!");
 }
 
@@ -3382,6 +3430,18 @@ void loop() {
     }
 
     AppStateEnum state = AppState::instance().getState();
+
+    if (gNeedCameraDeinitForAi) {
+        gNeedCameraDeinitForAi = false;
+        if (gCameraManager.isRunning()) {
+            gCameraManager.stopCapture();
+            Serial.println("AI: camera stopped for mic");
+        }
+    }
+
+    processForegroundCameraStart();
+    updateFaceVisionRuntime(now);
+
     updateSharedServoMotion(now);
     gServoMotionController.keepAlive(now);
     updateDanceLifecycle(now);
@@ -3393,10 +3453,6 @@ void loop() {
         gXiaoZhiClient.isListeningStarted()) {
         addAffinity(1, "AI listening");
         gAiListeningAffinityAwarded = true;
-    }
-
-    if (state == AppStateEnum::SERVO_TEST) {
-        updateServoTestFromImu(now);
     }
 
     if (state == AppStateEnum::POMODORO) {
@@ -3425,6 +3481,7 @@ void loop() {
     if (state == AppStateEnum::FACE) {
         gImuOrientation.update();
         if (gImuOrientation.isShaking()) {
+            requestFaceVisionBurst(now, FACE_VISION_TOUCH_BURST_MS, "face shake");
             if (now - gLastShakeTime > 5000) gShakeCount = 0;
             gShakeCount++;
             gLastShakeTime = now;
@@ -3448,6 +3505,7 @@ void loop() {
 
         TwistDirection twist = gImuOrientation.consumeTwist();
         if (twist == TwistDirection::CLOCKWISE) {
+            requestFaceVisionBurst(now, FACE_VISION_TOUCH_BURST_MS, "face twist");
             AppState::instance().setEmotion(FaceEmotion::CURIOUS);
             gFaceUI.setTemporaryGaze(0.8f, 0.0f, 1200);
             gServoMotionController.command(ServoMotionAction::RIGHT);
@@ -3455,6 +3513,7 @@ void loop() {
             gSickActive = true;
             gSickUntil = now + 1500;
         } else if (twist == TwistDirection::COUNTER_CLOCKWISE) {
+            requestFaceVisionBurst(now, FACE_VISION_TOUCH_BURST_MS, "face twist");
             AppState::instance().setEmotion(FaceEmotion::CURIOUS);
             gFaceUI.setTemporaryGaze(-0.8f, 0.0f, 1200);
             gServoMotionController.command(ServoMotionAction::LEFT);

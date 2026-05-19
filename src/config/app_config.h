@@ -66,6 +66,10 @@ constexpr int DETECTION_FPS = 5;
 constexpr bool FACE_DETECTION_ENABLED_ON_BOOT = true;
 constexpr int FACE_TRACKING_TIMEOUT_MS = 3000;  // No face -> NORMAL after this
 constexpr unsigned long SICK_EMOTION_DURATION_MS = 2000;
+constexpr unsigned long FACE_VISION_BOOT_BURST_MS = 6000;
+constexpr unsigned long FACE_VISION_TOUCH_BURST_MS = 8000;
+constexpr unsigned long FACE_VISION_IDLE_RESCAN_INTERVAL_MS = 45000;
+constexpr unsigned long FACE_VISION_IDLE_RESCAN_BURST_MS = 2500;
 
 // ==================== Wi-Fi ====================
 constexpr int WIFI_RECONNECT_INTERVAL_MS = 5000;
@@ -89,6 +93,7 @@ constexpr int POWER_TASK_INTERVAL_MS = 1000;    // 1 Hz monitoring
 constexpr float BATTERY_FULL_VOLTAGE = 4.2f;
 constexpr float BATTERY_EMPTY_VOLTAGE = 3.3f;
 constexpr float BATTERY_LOW_THRESHOLD = 3.5f;   // Go SLEEPY below this
+constexpr unsigned long BROWNOUT_SAFE_MODE_MS = 60000;
 
 // ==================== AI ====================
 constexpr bool XIAOZHI_REAL_ACTIVATION = true;
@@ -110,19 +115,10 @@ constexpr int SERVO_MAX_PULSE_US = 2400;
 constexpr int SERVO_PAN_CENTER_DEG = 90;
 constexpr int SERVO_TILT_CENTER_DEG = 140;
 constexpr int SERVO_CENTER_DEG = SERVO_PAN_CENTER_DEG;
-constexpr int SERVO_TEST_PAN_CENTER_DEG = 90;
-constexpr int SERVO_TEST_TILT_CENTER_DEG = 90;
 constexpr int SERVO_SAFE_MIN_DEG = 10;
 constexpr int SERVO_SAFE_MAX_DEG = 170;
 constexpr bool SERVO_PAN_INVERT = false;
 constexpr bool SERVO_TILT_INVERT = false;
-constexpr float SERVO_TEST_SWEEP_DEG = 90.0f;
-constexpr float SERVO_TEST_FILTER_ALPHA = 0.18f;
-constexpr float SERVO_TEST_DEADBAND_DEG = 2.0f;
-constexpr float SERVO_TEST_MAX_SPEED_DPS = 36.0f;
-constexpr float SERVO_TEST_TRANSITION_SPEED_DPS = 22.0f;
-constexpr unsigned long SERVO_TEST_INPUT_ENABLE_DELAY_MS = 1400;
-constexpr unsigned long SERVO_TEST_UPDATE_MS = 40;
 constexpr float SERVO_FACE_MOTION_SPEED_DPS = 28.0f;
 constexpr float SERVO_SAFE_CENTER_SPEED_DPS = 22.0f;
 constexpr float SERVO_TRACKING_MOTION_SPEED_DPS = 28.0f;
@@ -143,6 +139,7 @@ constexpr unsigned long SERVO_PHOTO_TRACK_SETTLE_MS = 2000;
 // ==================== Music ====================
 constexpr uint8_t MUSIC_SPEAKER_VOLUME = 64;
 constexpr unsigned long DANCE_MUSIC_START_DELAY_MS = 900;
+constexpr bool BOOT_CHIME_ENABLED = false;
 
 // ==================== Affinity ====================
 constexpr int AFFINITY_DEFAULT_VALUE = 35;
@@ -153,8 +150,8 @@ constexpr int AFFINITY_MAX_VALUE = 100;
 constexpr bool SERIAL_DIAGNOSTIC_HEARTBEAT = false;
 constexpr int SERIAL_HEARTBEAT_INTERVAL_MS = 5000;
 
-constexpr int UI_TASK_PRIORITY = 3;
-constexpr int TOUCH_TASK_PRIORITY = 2;
+constexpr int UI_TASK_PRIORITY = 2;
+constexpr int TOUCH_TASK_PRIORITY = 3;
 constexpr int CAMERA_TASK_PRIORITY = 2;
 constexpr int VISION_TASK_PRIORITY = 1;
 constexpr int AI_TASK_PRIORITY = 2;

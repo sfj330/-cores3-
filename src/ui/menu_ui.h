@@ -27,7 +27,7 @@ public:
 
     void markDirty();
 
-    static constexpr int APP_COUNT = 6;
+    static constexpr int APP_COUNT = 5;
 
 private:
     void drawApp(int index);

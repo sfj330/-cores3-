@@ -49,6 +49,7 @@ private:
     };
 
     static void taskThunk(void* arg);
+    bool ensureTask();
     void taskLoop();
     void playFile(int index);
     void playWavFile(int index, File& file);

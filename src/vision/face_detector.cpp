@@ -50,10 +50,8 @@ static inline bool isSkinPixelRGB565(uint16_t pixel) {
 
     if (r < 60 || g < 30 || b < 15) return false;
     if (r < g || r < b) return false;
-    int rg_diff = (int)r - (int)g;
-    if (rg_diff < 15) return false;
-    int rb_diff = (int)r - (int)b;
-    if (rb_diff < 15) return false;
+    if ((int)r - (int)g < 15) return false;
+    if ((int)r - (int)b < 15) return false;
     if (g > 200 && b > 200) return false;
     return true;
 }
@@ -64,15 +62,18 @@ FaceResult FaceDetector::detect(const uint8_t* frameData, int width, int height)
     }
 
     const uint16_t* pixels = reinterpret_cast<const uint16_t*>(frameData);
-    int step = 4;
+    constexpr int step = 4;
     int skinCount = 0;
-    long sumX = 0, sumY = 0;
-    int minX = width, maxX = 0, minY = height, maxY = 0;
+    long sumX = 0;
+    long sumY = 0;
+    int minX = width;
+    int maxX = 0;
+    int minY = height;
+    int maxY = 0;
 
     for (int y = 0; y < height; y += step) {
         for (int x = 0; x < width; x += step) {
             uint16_t pixel = pixels[y * width + x];
-            // Swap bytes (camera outputs big-endian RGB565)
             pixel = (pixel >> 8) | (pixel << 8);
 
             if (isSkinPixelRGB565(pixel)) {
@@ -88,8 +89,11 @@ FaceResult FaceDetector::detect(const uint8_t* frameData, int width, int height)
     }
 
     int totalSampled = (width / step) * (height / step);
-    float skinRatio = (float)skinCount / (float)totalSampled;
+    if (totalSampled <= 0) {
+        return FaceResult{};
+    }
 
+    float skinRatio = static_cast<float>(skinCount) / static_cast<float>(totalSampled);
     if (skinCount < 30 || skinRatio < 0.03f || skinRatio > 0.6f) {
         return FaceResult{};
     }
@@ -100,15 +104,15 @@ FaceResult FaceDetector::detect(const uint8_t* frameData, int width, int height)
         return FaceResult{};
     }
 
-    float aspect = (float)blobW / (float)blobH;
+    float aspect = static_cast<float>(blobW) / static_cast<float>(blobH);
     if (aspect < 0.4f || aspect > 2.5f) {
         return FaceResult{};
     }
 
     FaceResult result;
     result.detected = true;
-    result.centerX = (int)(sumX / skinCount);
-    result.centerY = (int)(sumY / skinCount);
+    result.centerX = static_cast<int>(sumX / skinCount);
+    result.centerY = static_cast<int>(sumY / skinCount);
     result.width = blobW;
     result.height = blobH;
     result.confidence = skinRatio > 0.15f ? 0.8f : 0.5f;

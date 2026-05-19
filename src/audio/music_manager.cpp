@@ -220,6 +220,10 @@ private:
 
 bool MusicManager::begin(StorageManager* storage) {
     storage_ = storage;
+    return true;
+}
+
+bool MusicManager::ensureTask() {
     if (taskHandle_ == nullptr) {
         BaseType_t ok = xTaskCreatePinnedToCore(
             taskThunk, "Music", 16384, this, 1, &taskHandle_, 0);
@@ -330,6 +334,9 @@ bool MusicManager::play(int index) {
     }
     if (index < 0 || index >= trackCount_) {
         setStatus("Track index error", MusicPlaybackState::ERROR);
+        return false;
+    }
+    if (!ensureTask()) {
         return false;
     }
     requestedIndex_ = index;

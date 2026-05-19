@@ -78,6 +78,8 @@ private:
 
     bool initAudio();
     void deinitAudio();
+    bool ensureAudioBuffers();
+    void releaseAudioBuffers();
     bool startMic();
     void stopMic();
     bool startSpeaker();
