@@ -19,6 +19,10 @@ constexpr float PWM_STEPS = 4096.0f;
 }
 
 bool ServoController::begin() {
+    if (permanentlyDisabled_) {
+        return false;
+    }
+
     if (!M5.Ex_I2C.begin()) {
         ready_ = false;
         released_ = true;
@@ -30,8 +34,15 @@ bool ServoController::begin() {
     if (!M5.Ex_I2C.scanID(static_cast<uint8_t>(PCA9685_I2C_ADDR), PCA9685_I2C_FREQ_HZ)) {
         ready_ = false;
         released_ = true;
-        status_ = String("PCA9685 not found @0x") + String(PCA9685_I2C_ADDR, HEX);
-        Serial.printf("Servo: PCA9685 not found at 0x%02X\n", PCA9685_I2C_ADDR);
+        scanFailCount_++;
+        if (scanFailCount_ >= 3) {
+            permanentlyDisabled_ = true;
+            status_ = "PCA9685 not found, disabled";
+            Serial.println("Servo: PCA9685 not found after 3 attempts, permanently disabled");
+        } else {
+            status_ = String("PCA9685 not found @0x") + String(PCA9685_I2C_ADDR, HEX);
+            Serial.printf("Servo: PCA9685 not found at 0x%02X (attempt %d/3)\n", PCA9685_I2C_ADDR, scanFailCount_);
+        }
         return false;
     }
 

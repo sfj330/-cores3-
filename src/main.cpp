@@ -3054,6 +3054,8 @@ static bool openForegroundCameraNow(const char* reason) {
         gCameraManager.end();
         vTaskDelay(pdMS_TO_TICKS(80));
         gCameraManager.resetFailure();
+        M5.In_I2C.release();
+        vTaskDelay(pdMS_TO_TICKS(10));
         cameraReady = ensureCameraTaskStarted();
         cameraReady = cameraReady && gCameraManager.begin();
         cameraReady = cameraReady && gCameraManager.startCapture();
@@ -3388,6 +3390,7 @@ void setup() {
     createTaskChecked(uiTask, "UI", UI_TASK_STACK_SIZE, UI_TASK_PRIORITY, &uiTaskHandle, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     createTaskChecked(touchTask, "Touch", TOUCH_TASK_STACK_SIZE, TOUCH_TASK_PRIORITY, &touchTaskHandle, 1);
+    gCameraManager.setTouchTaskHandle(touchTaskHandle);
     vTaskDelay(pdMS_TO_TICKS(50));
     if (gFaceDetector.backendAvailable()) {
         createTaskChecked(visionTask, "Vision", VISION_TASK_STACK_SIZE, VISION_TASK_PRIORITY, &visionTaskHandle, 0);

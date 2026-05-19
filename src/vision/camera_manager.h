@@ -27,6 +27,8 @@ public:
     bool begin();
     bool end();
 
+    void setTouchTaskHandle(TaskHandle_t handle);
+
     bool startCapture();
     bool stopCapture();
     bool isInitialized() const;
@@ -50,10 +52,12 @@ public:
 private:
     bool ensureMutex();
     void recordFail();
+    bool beginInternal();
 
     bool initialized_ = false;
     bool capturing_ = false;
     SemaphoreHandle_t cameraMutex_ = nullptr;
+    TaskHandle_t touchTaskHandle_ = nullptr;
 
     int consecutiveFailCount_ = 0;
     unsigned long lastFailTime_ = 0;

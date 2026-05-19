@@ -30,6 +30,8 @@ private:
 
     bool ready_ = false;
     bool released_ = true;
+    bool permanentlyDisabled_ = false;
+    int scanFailCount_ = 0;
     float panAngle_ = SERVO_PAN_CENTER_DEG;
     float tiltAngle_ = SERVO_TILT_CENTER_DEG;
     String status_ = "Servo not initialized";
